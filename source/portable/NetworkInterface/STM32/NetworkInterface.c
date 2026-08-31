@@ -65,6 +65,8 @@
     #include "stm32h7xx_hal.h"
 #elif defined( STM32H5 )
     #include "stm32h5xx_hal.h"
+#elif defined( STM32N6 )
+    #include "stm32n6xx_hal.h"
 #elif defined( STM32F2 )
     #error "This NetworkInterface is incompatible with STM32F2 - Use Legacy NetworkInterface"
 #else
@@ -81,6 +83,48 @@
     #define niEMAC_STM32FX
 #elif defined( STM32H7 ) || defined( STM32H5 )
     #define niEMAC_STM32HX
+#elif defined( STM32N6 )
+    #define niEMAC_STM32NX
+#endif
+
+#if defined( niEMAC_STM32HX ) || defined( niEMAC_STM32NX )
+    #define niEMAC_STM32HNX
+#endif
+
+#if defined( niEMAC_STM32NX )
+    #define niEMAC_ETH_INSTANCE       ETH1
+    #define niEMAC_ETH_IRQ_NUMBER     ETH1_IRQn
+    #define niEMAC_ETH_IRQ_HANDLER    ETH1_IRQHandler
+    #define niEMAC_DMA_CHANNEL_INDEX  ETH_DMA_CH0_IDX
+    #define niEMAC_RX_CHANNEL_COUNT   ETH_DMA_RX_CH_CNT
+    #define niEMAC_TX_CHANNEL_COUNT   ETH_DMA_TX_CH_CNT
+    #define niEMAC_RX_DESC_LIST( pxHandle, ulChannel )    ( ( pxHandle )->RxDescList[ ( ulChannel ) ] )
+    #define niEMAC_TX_DESC_LIST( pxHandle, ulChannel )    ( ( pxHandle )->TxDescList[ ( ulChannel ) ] )
+#else
+    #define niEMAC_ETH_INSTANCE       ETH
+    #define niEMAC_ETH_IRQ_NUMBER     ETH_IRQn
+    #define niEMAC_ETH_IRQ_HANDLER    ETH_IRQHandler
+    #define niEMAC_RX_CHANNEL_COUNT   1U
+    #define niEMAC_TX_CHANNEL_COUNT   1U
+    #define niEMAC_RX_DESC_LIST( pxHandle, ulChannel )    ( ( pxHandle )->RxDescList )
+    #define niEMAC_TX_DESC_LIST( pxHandle, ulChannel )    ( ( pxHandle )->TxDescList )
+#endif
+
+#if defined( niEMAC_STM32FX )
+    #define niEMAC_ETH_CLOCKS_ENABLED()    ( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 )
+#elif defined( STM32H5 )
+    #define niEMAC_ETH_CLOCKS_ENABLED()    ( ( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETHTX_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETHRX_IS_CLK_ENABLED() != 0 ) )
+#elif defined( STM32H7 )
+    #define niEMAC_ETH_CLOCKS_ENABLED()    ( ( __HAL_RCC_ETH1MAC_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETH1TX_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETH1RX_IS_CLK_ENABLED() != 0 ) )
+#elif defined( niEMAC_STM32NX )
+    #define niEMAC_ETH_CLOCKS_ENABLED()    ( ( __HAL_RCC_ETH1_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETH1MAC_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETH1TX_IS_CLK_ENABLED() != 0 ) && \
+                                             ( __HAL_RCC_ETH1RX_IS_CLK_ENABLED() != 0 ) )
 #endif
 
 #define niEMAC_TASK_NAME                  "EMAC_STM32"
@@ -107,7 +151,12 @@
 
 #define niEMAC_USE_RMII                   ipconfigENABLE
 
-#define niEMAC_USE_MPU                    ipconfigENABLE
+/* DMA descriptor sections must always be non-cacheable. Packet buffers may
+ * instead use explicit cache maintenance by defining niEMAC_USE_MPU as
+ * ipconfigDISABLE in the consuming project. */
+#ifndef niEMAC_USE_MPU
+    #define niEMAC_USE_MPU    ipconfigENABLE
+#endif
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
@@ -208,11 +257,10 @@
 #if defined( niEMAC_STM32FX )
 
 /* Note: ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG is incorrectly defined in HAL ETH Driver as of F7 V1.17.1 && F4 V1.28.0 */
-    #undef ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG
-    #define ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_RBUS
-
-    #undef ETH_DMA_TX_BUFFER_UNAVAILABLE_FLAG
-    #define ETH_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_TBUS
+    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_RBUS
+    #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_TBUS
+    #define niEMAC_DMA_ERROR_MASK                    HAL_ETH_ERROR_DMA
+    #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACA1HR_AE
 
 /* Note: ETH_CTRLPACKETS_BLOCK_ALL is incorrectly defined in HAL ETH Driver as of F7 V1.17.1 && F4 V1.28.0 */
     #undef ETH_CTRLPACKETS_BLOCK_ALL
@@ -238,13 +286,25 @@
 
 #elif defined( niEMAC_STM32HX )
 
-    #undef ETH_DMA_TX_BUFFER_UNAVAILABLE_FLAG
-    #define ETH_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACSR_TBU
+    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACSR_RBU
+    #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACSR_TBU
+    #define niEMAC_DMA_ERROR_MASK                    HAL_ETH_ERROR_DMA
+    #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACA1HR_AE
 
     #undef ETH_IP_PAYLOAD_IGMP
-    #define ETH_IP_PAYLOAD_IGMP                   0x4U
+    #define ETH_IP_PAYLOAD_IGMP    0x4U
 
-#endif /* if defined( niEMAC_STM32FX ) */
+#elif defined( niEMAC_STM32NX )
+
+    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACxSR_RBU
+    #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACxSR_TBU
+    #define niEMAC_DMA_ERROR_MASK                    ( HAL_ETH_ERROR_DMA_CH0 | HAL_ETH_ERROR_DMA_CH1 )
+    #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACAxHR_AE
+
+    #undef ETH_IP_PAYLOAD_IGMP
+    #define ETH_IP_PAYLOAD_IGMP    0x4U
+
+#endif /* family-specific compatibility definitions */
 
 #define ETH_IP_PAYLOAD_MASK           0x7U
 
@@ -355,7 +415,7 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                                     NetworkInterface_t * pxInterface );
 static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
                                  NetworkInterface_t * pxInterface );
-#ifdef niEMAC_STM32HX
+#ifdef niEMAC_STM32HNX
     static void prvInitPacketFilter( ETH_HandleTypeDef * pxEthHandle,
                                      const NetworkInterface_t * const pxInterface );
 #endif
@@ -392,6 +452,17 @@ static void prvReleaseNetworkBufferDescriptor( NetworkBufferDescriptor_t * const
 static void prvSendRxEvent( NetworkBufferDescriptor_t * const pxDescriptor );
 static BaseType_t prvAcceptPacket( const NetworkBufferDescriptor_t * const pxDescriptor,
                                    uint16_t usLength );
+#ifdef niEMAC_CACHEABLE
+    static uintptr_t prvGetCacheAlignedRange( const void * pvAddress,
+                                              size_t uxLength,
+                                              size_t * puxAlignedLength );
+    static void prvCacheCleanByAddr( const void * pvAddress,
+                                     size_t uxLength );
+    static void prvCacheCleanInvalidateByAddr( const void * pvAddress,
+                                               size_t uxLength );
+    static void prvCacheInvalidateByAddr( const void * pvAddress,
+                                          size_t uxLength );
+#endif
 
 /* Network Interface Definition */
 NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
@@ -423,6 +494,64 @@ static uint8_t uxMACEntryIndex = 0;
 /* Src Mac Hashing */
 static uint32_t ulHashTable[ niEMAC_ADDRESS_HASH_BITS / 32 ];
 static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
+
+/*---------------------------------------------------------------------------*/
+
+#ifdef niEMAC_CACHEABLE
+
+    static uintptr_t prvGetCacheAlignedRange( const void * pvAddress,
+                                              size_t uxLength,
+                                              size_t * puxAlignedLength )
+    {
+        const uintptr_t uxAddress = ( uintptr_t ) pvAddress;
+        const uintptr_t uxLineStart = uxAddress & ~( ( uintptr_t ) niEMAC_DATA_ALIGNMENT_MASK );
+        const uintptr_t uxLineEnd = ( uxAddress + uxLength + niEMAC_DATA_ALIGNMENT_MASK ) & ~( ( uintptr_t ) niEMAC_DATA_ALIGNMENT_MASK );
+
+        *puxAlignedLength = uxLineEnd - uxLineStart;
+
+        return uxLineStart;
+    }
+
+/*---------------------------------------------------------------------------*/
+
+    static void prvCacheCleanByAddr( const void * pvAddress,
+                                     size_t uxLength )
+    {
+        if( ( pvAddress != NULL ) && ( uxLength > 0U ) )
+        {
+            size_t uxAlignedLength;
+            const uintptr_t uxLineStart = prvGetCacheAlignedRange( pvAddress, uxLength, &uxAlignedLength );
+            SCB_CleanDCache_by_Addr( ( uint32_t * ) uxLineStart, ( int32_t ) uxAlignedLength );
+        }
+    }
+
+/*---------------------------------------------------------------------------*/
+
+    static void prvCacheCleanInvalidateByAddr( const void * pvAddress,
+                                               size_t uxLength )
+    {
+        if( ( pvAddress != NULL ) && ( uxLength > 0U ) )
+        {
+            size_t uxAlignedLength;
+            const uintptr_t uxLineStart = prvGetCacheAlignedRange( pvAddress, uxLength, &uxAlignedLength );
+            SCB_CleanInvalidateDCache_by_Addr( ( uint32_t * ) uxLineStart, ( int32_t ) uxAlignedLength );
+        }
+    }
+
+/*---------------------------------------------------------------------------*/
+
+    static void prvCacheInvalidateByAddr( const void * pvAddress,
+                                          size_t uxLength )
+    {
+        if( ( pvAddress != NULL ) && ( uxLength > 0U ) )
+        {
+            size_t uxAlignedLength;
+            const uintptr_t uxLineStart = prvGetCacheAlignedRange( pvAddress, uxLength, &uxAlignedLength );
+            SCB_InvalidateDCache_by_Addr( ( uint32_t * ) uxLineStart, ( int32_t ) uxAlignedLength );
+        }
+    }
+
+#endif /* ifdef niEMAC_CACHEABLE */
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
@@ -608,6 +737,10 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
             .Attributes = ETH_TX_PACKETS_FEATURES_CRCPAD,
         };
 
+        #if defined( niEMAC_STM32NX )
+            xTxConfig.TxDMACh = niEMAC_DMA_CHANNEL_INDEX;
+        #endif
+
         #if ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM )
             xTxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
             xTxConfig.Attributes |= ETH_TX_PACKETS_FEATURES_CSUM;
@@ -673,11 +806,7 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
         #ifdef niEMAC_CACHEABLE
             if( niEMAC_CACHE_MAINTENANCE != 0 )
             {
-                const uintptr_t uxDataStart = ( uintptr_t ) xTxBuffer.buffer;
-                const uintptr_t uxLineStart = uxDataStart & ~niEMAC_DATA_ALIGNMENT_MASK;
-                const ptrdiff_t uxDataOffset = uxDataStart - uxLineStart;
-                const size_t uxLength = xTxBuffer.len + uxDataOffset;
-                SCB_CleanDCache_by_Addr( ( uint32_t * ) uxLineStart, uxLength );
+                prvCacheCleanByAddr( xTxBuffer.buffer, xTxBuffer.len );
             }
         #endif
 
@@ -764,35 +893,46 @@ static BaseType_t prvNetworkInterfaceInput( ETH_HandleTypeDef * pxEthHandle,
 
     if( ( xMacInitStatus == eMacInitComplete ) && ( pxEthHandle->gState == HAL_ETH_STATE_STARTED ) )
     {
-        while( HAL_ETH_ReadData( pxEthHandle, ( void ** ) &pxCurDescriptor ) == HAL_OK )
+        for( uint32_t ulChannel = 0; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
         {
-            ++uxCount;
+            #if defined( niEMAC_STM32NX )
+                pxEthHandle->RxOpCH = ulChannel;
+            #endif
 
-            if( pxCurDescriptor == NULL )
+            while( HAL_ETH_ReadData( pxEthHandle, ( void ** ) &pxCurDescriptor ) == HAL_OK )
             {
-                /* Buffer was dropped, ignore packet */
-                continue;
+                ++uxCount;
+
+                if( pxCurDescriptor == NULL )
+                {
+                    /* Buffer was dropped, ignore packet */
+                    continue;
+                }
+
+                configASSERT( pxCurDescriptor->xDataLength <= niEMAC_DATA_BUFFER_SIZE );
+
+                pxCurDescriptor->pxInterface = pxInterface;
+                pxCurDescriptor->pxEndPoint = FreeRTOS_MatchingEndpoint( pxCurDescriptor->pxInterface, pxCurDescriptor->pucEthernetBuffer );
+                #if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES )
+                    if( pxStartDescriptor == NULL )
+                    {
+                        pxStartDescriptor = pxCurDescriptor;
+                    }
+                    else if( pxEndDescriptor != NULL )
+                    {
+                        pxEndDescriptor->pxNextBuffer = pxCurDescriptor;
+                    }
+
+                    pxEndDescriptor = pxCurDescriptor;
+                #else /* if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES ) */
+                    prvSendRxEvent( pxCurDescriptor );
+                #endif /* if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES ) */
             }
-
-            configASSERT( pxCurDescriptor->xDataLength <= niEMAC_DATA_BUFFER_SIZE );
-
-            pxCurDescriptor->pxInterface = pxInterface;
-            pxCurDescriptor->pxEndPoint = FreeRTOS_MatchingEndpoint( pxCurDescriptor->pxInterface, pxCurDescriptor->pucEthernetBuffer );
-            #if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES )
-                if( pxStartDescriptor == NULL )
-                {
-                    pxStartDescriptor = pxCurDescriptor;
-                }
-                else if( pxEndDescriptor != NULL )
-                {
-                    pxEndDescriptor->pxNextBuffer = pxCurDescriptor;
-                }
-
-                pxEndDescriptor = pxCurDescriptor;
-            #else /* if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES ) */
-                prvSendRxEvent( pxCurDescriptor );
-            #endif /* if ipconfigIS_ENABLED( ipconfigUSE_LINKED_RX_MESSAGES ) */
         }
+
+        #if defined( niEMAC_STM32NX )
+            pxEthHandle->RxOpCH = niEMAC_DMA_CHANNEL_INDEX;
+        #endif
     }
 
     if( uxCount > 0 )
@@ -977,7 +1117,7 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
 {
     BaseType_t xResult = pdFALSE;
 
-    pxEthHandle->Instance = ETH;
+    pxEthHandle->Instance = niEMAC_ETH_INSTANCE;
     pxEthHandle->Init.MediaInterface = ipconfigIS_ENABLED( niEMAC_USE_RMII ) ? HAL_ETH_RMII_MODE : HAL_ETH_MII_MODE;
     pxEthHandle->Init.RxBuffLen = niEMAC_DATA_BUFFER_SIZE;
     /* configASSERT( pxEthHandle->Init.RxBuffLen <= ETH_MAX_PACKET_SIZE ); */
@@ -986,10 +1126,29 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
         configASSERT( pxEthHandle->Init.RxBuffLen == ETH_RX_BUF_SIZE );
     #endif
 
-    static ETH_DMADescTypeDef xDMADescTx[ ETH_TX_DESC_CNT ] __ALIGNED( portBYTE_ALIGNMENT ) __attribute__( ( section( niEMAC_TX_DESC_SECTION ) ) );
-    static ETH_DMADescTypeDef xDMADescRx[ ETH_RX_DESC_CNT ] __ALIGNED( portBYTE_ALIGNMENT ) __attribute__( ( section( niEMAC_RX_DESC_SECTION ) ) );
-    pxEthHandle->Init.TxDesc = xDMADescTx;
-    pxEthHandle->Init.RxDesc = xDMADescRx;
+    #if defined( niEMAC_STM32NX )
+        static ETH_DMADescTypeDef xDMADescTx[ ETH_DMA_TX_CH_CNT ][ ETH_TX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_TX_DESC_SECTION ) ) );
+        static ETH_DMADescTypeDef xDMADescRx[ ETH_DMA_RX_CH_CNT ][ ETH_RX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_RX_DESC_SECTION ) ) );
+
+        for( uint32_t ulChannel = 0; ulChannel < ETH_DMA_TX_CH_CNT; ulChannel++ )
+        {
+            configASSERT( ( ( uintptr_t ) xDMADescTx[ ulChannel ] & niEMAC_DATA_ALIGNMENT_MASK ) == 0U );
+            pxEthHandle->Init.TxDesc[ ulChannel ] = xDMADescTx[ ulChannel ];
+        }
+
+        for( uint32_t ulChannel = 0; ulChannel < ETH_DMA_RX_CH_CNT; ulChannel++ )
+        {
+            configASSERT( ( ( uintptr_t ) xDMADescRx[ ulChannel ] & niEMAC_DATA_ALIGNMENT_MASK ) == 0U );
+            pxEthHandle->Init.RxDesc[ ulChannel ] = xDMADescRx[ ulChannel ];
+        }
+    #else
+        static ETH_DMADescTypeDef xDMADescTx[ ETH_TX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_TX_DESC_SECTION ) ) );
+        static ETH_DMADescTypeDef xDMADescRx[ ETH_RX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_RX_DESC_SECTION ) ) );
+        configASSERT( ( ( uintptr_t ) xDMADescTx & niEMAC_DATA_ALIGNMENT_MASK ) == 0U );
+        configASSERT( ( ( uintptr_t ) xDMADescRx & niEMAC_DATA_ALIGNMENT_MASK ) == 0U );
+        pxEthHandle->Init.TxDesc = xDMADescTx;
+        pxEthHandle->Init.RxDesc = xDMADescRx;
+    #endif
     ( void ) memset( &xDMADescTx, 0, sizeof( xDMADescTx ) );
     ( void ) memset( &xDMADescRx, 0, sizeof( xDMADescRx ) );
 
@@ -1024,10 +1183,20 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                  *  xDMAConfig.TCPSegmentation = ENABLE;
                  *  xDMAConfig.MaximumSegmentSize = ipconfigTCP_MSS;
                  #endif */
+            #elif defined( niEMAC_STM32NX )
+                for( uint32_t ulChannel = 0; ulChannel < ETH_DMA_CH_CNT; ulChannel++ )
+                {
+                    xDMAConfig.DMACh[ ulChannel ].SecondPacketOperate = ENABLE;
+
+                    /* #if ipconfigIS_ENABLED( ipconfigUSE_TCP ) && ipconfigIS_ENABLED( niEMAC_TCP_SEGMENTATION )
+                     *  xDMAConfig.DMACh[ ulChannel ].TCPSegmentation = ENABLE;
+                     *  xDMAConfig.DMACh[ ulChannel ].MaximumSegmentSize = ipconfigTCP_MSS;
+                     #endif */
+                }
             #endif
             ( void ) HAL_ETH_SetDMAConfig( pxEthHandle, &xDMAConfig );
 
-            #if defined( niEMAC_STM32HX )
+            #if defined( niEMAC_STM32HNX )
                 prvInitPacketFilter( pxEthHandle, pxInterface );
 
                 /* HAL_ETHEx_DisableARPOffload( pxEthHandle );
@@ -1044,7 +1213,7 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
     if( xResult == pdTRUE )
     {
         #ifdef niEMAC_CACHEABLE
-            if( niEMAC_CACHE_ENABLED )
+            if( niEMAC_CACHE_ENABLED && ipconfigIS_ENABLED( niEMAC_USE_MPU ) )
             {
                 #ifdef niEMAC_MPU
                     configASSERT( niEMAC_MPU_ENABLED != 0 );
@@ -1060,31 +1229,21 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
         #else
             const uint32_t ulPrioBits = __NVIC_PRIO_BITS;
         #endif
-        const uint32_t ulPriority = NVIC_GetPriority( ETH_IRQn ) << ( 8U - ulPrioBits );
+        const uint32_t ulPriority = NVIC_GetPriority( niEMAC_ETH_IRQ_NUMBER ) << ( 8U - ulPrioBits );
 
         if( ulPriority < configMAX_SYSCALL_INTERRUPT_PRIORITY )
         {
-            FreeRTOS_debug_printf( ( "prvEthConfigInit: Incorrectly set ETH_IRQn priority\n" ) );
-            NVIC_SetPriority( ETH_IRQn, configMAX_SYSCALL_INTERRUPT_PRIORITY >> ( 8U - ulPrioBits ) );
+            FreeRTOS_debug_printf( ( "prvEthConfigInit: Incorrectly set Ethernet IRQ priority\n" ) );
+            NVIC_SetPriority( niEMAC_ETH_IRQ_NUMBER, configMAX_SYSCALL_INTERRUPT_PRIORITY >> ( 8U - ulPrioBits ) );
         }
 
-        if( NVIC_GetEnableIRQ( ETH_IRQn ) == 0 )
+        if( NVIC_GetEnableIRQ( niEMAC_ETH_IRQ_NUMBER ) == 0 )
         {
-            FreeRTOS_debug_printf( ( "prvEthConfigInit: ETH_IRQn was not enabled by application\n" ) );
-            HAL_NVIC_EnableIRQ( ETH_IRQn );
+            FreeRTOS_debug_printf( ( "prvEthConfigInit: Ethernet IRQ was not enabled by application\n" ) );
+            HAL_NVIC_EnableIRQ( niEMAC_ETH_IRQ_NUMBER );
         }
 
-        #ifdef niEMAC_STM32FX
-            configASSERT( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 );
-        #elif defined( STM32H5 )
-            configASSERT( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 );
-            configASSERT( __HAL_RCC_ETHTX_IS_CLK_ENABLED() != 0 );
-            configASSERT( __HAL_RCC_ETHRX_IS_CLK_ENABLED() != 0 );
-        #elif defined( STM32H7 )
-            configASSERT( __HAL_RCC_ETH1MAC_IS_CLK_ENABLED() != 0 );
-            configASSERT( __HAL_RCC_ETH1TX_IS_CLK_ENABLED() != 0 );
-            configASSERT( __HAL_RCC_ETH1RX_IS_CLK_ENABLED() != 0 );
-        #endif
+        configASSERT( niEMAC_ETH_CLOCKS_ENABLED() );
     }
 
     return xResult;
@@ -1140,7 +1299,7 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
 
 /*---------------------------------------------------------------------------*/
 
-#ifdef niEMAC_STM32HX
+#ifdef niEMAC_STM32HNX
 
     static void prvInitPacketFilter( ETH_HandleTypeDef * pxEthHandle,
                                      const NetworkInterface_t * const pxInterface )
@@ -1270,7 +1429,7 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
         #endif /* if ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM ) */
     }
 
-#endif /* ifdef niEMAC_STM32HX */
+#endif /* ifdef niEMAC_STM32HNX */
 
 /*---------------------------------------------------------------------------*/
 
@@ -1396,7 +1555,7 @@ static void prvHAL_ETH_SetDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
     /* MACA0HR/MACA0LR reserved for the primary MAC-address. */
     const uint32_t ulMacRegHigh = ( ( uint32_t ) &( pxEthInstance->MACA1HR ) + ( 8 * ucIndex ) );
     const uint32_t ulMacRegLow = ( ( uint32_t ) &( pxEthInstance->MACA1LR ) + ( 8 * ucIndex ) );
-    ( *( __IO uint32_t * ) ulMacRegHigh ) = ETH_MACA1HR_AE | ulMacAddrHigh;
+    ( *( __IO uint32_t * ) ulMacRegHigh ) = niEMAC_MAC_ADDRESS_ENABLE_FLAG | ulMacAddrHigh;
     ( *( __IO uint32_t * ) ulMacRegLow ) = ulMacAddrLow;
 }
 
@@ -1575,6 +1734,9 @@ static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle )
 {
     if( xSemaphoreTake( xTxMutex, pdMS_TO_TICKS( niEMAC_TX_MAX_BLOCK_TIME_MS ) ) != pdFALSE )
     {
+        #if defined( niEMAC_STM32NX )
+            pxEthHandle->TxOpCH = niEMAC_DMA_CHANNEL_INDEX;
+        #endif
         ( void ) HAL_ETH_ReleaseTxPacket( pxEthHandle );
         ( void ) xSemaphoreGive( xTxMutex );
     }
@@ -1703,9 +1865,15 @@ static BaseType_t prvAcceptPacket( const NetworkBufferDescriptor_t * const pxDes
 
         #if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
         {
-            const ETH_DMADescTypeDef * const pxRxDesc = ( const ETH_DMADescTypeDef * const ) pxEthHandle->RxDescList.RxDesc[ pxEthHandle->RxDescList.RxDescIdx ];
+            #if defined( niEMAC_STM32NX )
+                const uint32_t ulRxChannel = pxEthHandle->RxOpCH;
+            #else
+                const uint32_t ulRxChannel = 0U;
+            #endif
+            const ETH_RxDescListTypeDef * const pxRxDescList = &( niEMAC_RX_DESC_LIST( pxEthHandle, ulRxChannel ) );
+            const ETH_DMADescTypeDef * const pxRxDesc = ( const ETH_DMADescTypeDef * const ) pxRxDescList->RxDesc[ pxRxDescList->RxDescIdx ];
             uint32_t ulRxDesc;
-            #ifdef niEMAC_STM32HX
+            #ifdef niEMAC_STM32HNX
                 ulRxDesc = pxRxDesc->DESC1;
             #elif defined( niEMAC_STM32FX )
                 ulRxDesc = pxRxDesc->DESC4;
@@ -1755,7 +1923,7 @@ static BaseType_t prvAcceptPacket( const NetworkBufferDescriptor_t * const pxDes
                 #endif
             }
 
-            #ifdef niEMAC_STM32HX
+            #ifdef niEMAC_STM32HNX
                 else if( ( ulRxDesc & ETH_IP_PAYLOAD_MASK ) == ETH_IP_PAYLOAD_IGMP )
                 {
                 }
@@ -1783,7 +1951,7 @@ static BaseType_t prvAcceptPacket( const NetworkBufferDescriptor_t * const pxDes
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
-void ETH_IRQHandler( void )
+void niEMAC_ETH_IRQ_HANDLER( void )
 {
     traceISR_ENTER();
 
@@ -1807,17 +1975,17 @@ void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
         eErrorEvents |= eMacEventErrEth;
     }
 
-    if( ( pxEthHandle->ErrorCode & HAL_ETH_ERROR_DMA ) != 0 )
+    if( ( pxEthHandle->ErrorCode & niEMAC_DMA_ERROR_MASK ) != 0 )
     {
         eErrorEvents |= eMacEventErrDma;
         const uint32_t ulDmaError = pxEthHandle->DMAErrorCode;
 
-        if( ( ulDmaError & ETH_DMA_TX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
+        if( ( ulDmaError & niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
         {
             eErrorEvents |= eMacEventErrTx;
         }
 
-        if( ( ulDmaError & ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
+        if( ( ulDmaError & niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
         {
             eErrorEvents |= eMacEventErrRx;
         }
@@ -1842,11 +2010,14 @@ void HAL_ETH_RxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 {
     static size_t uxMostRXDescsUsed = 0U;
 
-    const size_t uxRxUsed = pxEthHandle->RxDescList.RxDescCnt;
-
-    if( uxMostRXDescsUsed < uxRxUsed )
+    for( uint32_t ulChannel = 0; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
     {
-        uxMostRXDescsUsed = uxRxUsed;
+        const size_t uxRxUsed = niEMAC_RX_DESC_LIST( pxEthHandle, ulChannel ).RxDescCnt;
+
+        if( uxMostRXDescsUsed < uxRxUsed )
+        {
+            uxMostRXDescsUsed = uxRxUsed;
+        }
     }
 
     iptraceNETWORK_INTERFACE_RECEIVE();
@@ -1865,11 +2036,14 @@ void HAL_ETH_TxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 {
     static size_t uxMostTXDescsUsed = 0U;
 
-    const size_t uxTxUsed = pxEthHandle->TxDescList.BuffersInUse;
-
-    if( uxMostTXDescsUsed < uxTxUsed )
+    for( uint32_t ulChannel = 0; ulChannel < niEMAC_TX_CHANNEL_COUNT; ulChannel++ )
     {
-        uxMostTXDescsUsed = uxTxUsed;
+        const size_t uxTxUsed = niEMAC_TX_DESC_LIST( pxEthHandle, ulChannel ).BuffersInUse;
+
+        if( uxMostTXDescsUsed < uxTxUsed )
+        {
+            uxMostTXDescsUsed = uxTxUsed;
+        }
     }
 
     iptraceNETWORK_INTERFACE_TRANSMIT();
@@ -1897,7 +2071,10 @@ void HAL_ETH_RxAllocateCallback( uint8_t ** ppucBuff )
         #ifdef niEMAC_CACHEABLE
             if( niEMAC_CACHE_MAINTENANCE != 0 )
             {
-                SCB_InvalidateDCache_by_Addr( ( uint32_t * ) pxBufferDescriptor->pucEthernetBuffer, pxBufferDescriptor->xDataLength );
+                /* The hidden network-buffer pointer can share the first cache
+                 * line with the Ethernet payload. Clean it before invalidating
+                 * the complete DMA receive range. */
+                prvCacheCleanInvalidateByAddr( pxBufferDescriptor->pucEthernetBuffer, niEMAC_DATA_BUFFER_SIZE );
             }
         #endif
         *ppucBuff = pxBufferDescriptor->pucEthernetBuffer;
@@ -1916,6 +2093,14 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
                              uint8_t * pucBuff,
                              uint16_t usLength )
 {
+    #ifdef niEMAC_CACHEABLE
+        if( niEMAC_CACHE_MAINTENANCE != 0 )
+        {
+            /* Invalidate DMA-written data before the packet or its hidden
+             * network-buffer pointer is read by the CPU. */
+            prvCacheInvalidateByAddr( pucBuff, usLength );
+        }
+    #endif
     NetworkBufferDescriptor_t ** const ppxStartDescriptor = ( NetworkBufferDescriptor_t ** ) ppvStart;
     NetworkBufferDescriptor_t ** const ppxEndDescriptor = ( NetworkBufferDescriptor_t ** ) ppvEnd;
     NetworkBufferDescriptor_t * const pxCurDescriptor = pxPacketBuffer_to_NetworkBuffer( ( const void * ) pucBuff );
@@ -1941,12 +2126,6 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
         *ppxEndDescriptor = pxCurDescriptor;
         /* Only single buffer packets are supported */
         configASSERT( *ppxStartDescriptor == *ppxEndDescriptor );
-        #ifdef niEMAC_CACHEABLE
-            if( niEMAC_CACHE_MAINTENANCE != 0 )
-            {
-                SCB_InvalidateDCache_by_Addr( ( uint32_t * ) pucBuff, usLength );
-            }
-        #endif
     }
     else
     {
@@ -2049,7 +2228,7 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
  */
     void HAL_ETH_MspInit( ETH_HandleTypeDef * pxEthHandle )
     {
-        if( pxEthHandle->Instance == ETH )
+        if( pxEthHandle->Instance == niEMAC_ETH_INSTANCE )
         {
             /* Enable ETHERNET clock */
             #ifdef niEMAC_STM32FX
@@ -2059,6 +2238,11 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
                 __HAL_RCC_ETHTX_CLK_ENABLE();
                 __HAL_RCC_ETHRX_CLK_ENABLE();
             #elif defined( STM32H7 )
+                __HAL_RCC_ETH1MAC_CLK_ENABLE();
+                __HAL_RCC_ETH1TX_CLK_ENABLE();
+                __HAL_RCC_ETH1RX_CLK_ENABLE();
+            #elif defined( niEMAC_STM32NX )
+                __HAL_RCC_ETH1_CLK_ENABLE();
                 __HAL_RCC_ETH1MAC_CLK_ENABLE();
                 __HAL_RCC_ETH1TX_CLK_ENABLE();
                 __HAL_RCC_ETH1RX_CLK_ENABLE();
@@ -2174,8 +2358,8 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
             }
 
             /* Enable the Ethernet global Interrupt */
-            HAL_NVIC_SetPriority( ETH_IRQn, ( uint32_t ) configMAX_SYSCALL_INTERRUPT_PRIORITY, 0 );
-            HAL_NVIC_EnableIRQ( ETH_IRQn );
+            HAL_NVIC_SetPriority( niEMAC_ETH_IRQ_NUMBER, ( uint32_t ) configMAX_SYSCALL_INTERRUPT_PRIORITY, 0 );
+            HAL_NVIC_EnableIRQ( niEMAC_ETH_IRQ_NUMBER );
         }
     }
 
@@ -2183,7 +2367,7 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
 
     void HAL_ETH_MspDeInit( ETH_HandleTypeDef * pxEthHandle )
     {
-        if( pxEthHandle->Instance == ETH )
+        if( pxEthHandle->Instance == niEMAC_ETH_INSTANCE )
         {
             /* Peripheral clock disable */
             #ifdef niEMAC_STM32FX
@@ -2193,6 +2377,11 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
                 __HAL_RCC_ETHTX_CLK_DISABLE();
                 __HAL_RCC_ETHRX_CLK_DISABLE();
             #elif defined( STM32H7 )
+                __HAL_RCC_ETH1MAC_CLK_DISABLE();
+                __HAL_RCC_ETH1TX_CLK_DISABLE();
+                __HAL_RCC_ETH1RX_CLK_DISABLE();
+            #elif defined( niEMAC_STM32NX )
+                __HAL_RCC_ETH1_CLK_DISABLE();
                 __HAL_RCC_ETH1MAC_CLK_DISABLE();
                 __HAL_RCC_ETH1TX_CLK_DISABLE();
                 __HAL_RCC_ETH1RX_CLK_DISABLE();
@@ -2253,7 +2442,7 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
             }
 
             /* ETH interrupt Deinit */
-            HAL_NVIC_DisableIRQ( ETH_IRQn );
+            HAL_NVIC_DisableIRQ( niEMAC_ETH_IRQ_NUMBER );
         }
     }
 
