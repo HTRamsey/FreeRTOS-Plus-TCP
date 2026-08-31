@@ -64,6 +64,8 @@
     #include "stm32f7xx_hal.h"
 #elif defined( STM32H7 )
     #include "stm32h7xx_hal.h"
+#elif defined( STM32H7RS )
+    #include "stm32h7rsxx_hal.h"
 #elif defined( STM32H5 )
     #include "stm32h5xx_hal.h"
 #elif defined( STM32N6 )
@@ -82,7 +84,7 @@
 
 #if defined( STM32F7 ) || defined( STM32F4 )
     #define niEMAC_STM32FX
-#elif defined( STM32H7 ) || defined( STM32H5 )
+#elif defined( STM32H7 ) || defined( STM32H7RS ) || defined( STM32H5 )
     #define niEMAC_STM32HX
 #elif defined( STM32N6 )
     #define niEMAC_STM32NX
@@ -119,7 +121,7 @@
     ( ( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 ) &&   \
       ( __HAL_RCC_ETHTX_IS_CLK_ENABLED() != 0 ) && \
       ( __HAL_RCC_ETHRX_IS_CLK_ENABLED() != 0 ) )
-#elif defined( STM32H7 )
+#elif defined( STM32H7 ) || defined( STM32H7RS )
     #define niEMAC_ETH_CLOCKS_ENABLED()              \
     ( ( __HAL_RCC_ETH1MAC_IS_CLK_ENABLED() != 0 ) && \
       ( __HAL_RCC_ETH1TX_IS_CLK_ENABLED() != 0 ) &&  \
@@ -2666,7 +2668,7 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
                 __HAL_RCC_ETH_CLK_ENABLE();
                 __HAL_RCC_ETHTX_CLK_ENABLE();
                 __HAL_RCC_ETHRX_CLK_ENABLE();
-            #elif defined( STM32H7 )
+            #elif defined( STM32H7 ) || defined( STM32H7RS )
                 __HAL_RCC_ETH1MAC_CLK_ENABLE();
                 __HAL_RCC_ETH1TX_CLK_ENABLE();
                 __HAL_RCC_ETH1RX_CLK_ENABLE();
@@ -2805,7 +2807,7 @@ NetworkInterface_t * pxSTM32_FillInterfaceDescriptor( BaseType_t xEMACIndex,
                 __HAL_RCC_ETH_CLK_DISABLE();
                 __HAL_RCC_ETHTX_CLK_DISABLE();
                 __HAL_RCC_ETHRX_CLK_DISABLE();
-            #elif defined( STM32H7 )
+            #elif defined( STM32H7 ) || defined( STM32H7RS )
                 __HAL_RCC_ETH1MAC_CLK_DISABLE();
                 __HAL_RCC_ETH1TX_CLK_DISABLE();
                 __HAL_RCC_ETH1RX_CLK_DISABLE();
