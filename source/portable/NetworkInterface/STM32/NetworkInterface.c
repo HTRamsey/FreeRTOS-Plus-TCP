@@ -194,10 +194,6 @@
 
 #if ipconfigIS_DISABLED( ipconfigPORT_SUPPRESS_WARNING )
 
-    #if defined( niEMAC_STM32FX ) && defined( ETH_RX_BUF_SIZE )
-        #warning "As of F7 V1.17.1 && F4 V1.28.0, a bug exists in the ETH HAL Driver where ETH_RX_BUF_SIZE is used instead of RxBuffLen, so ETH_RX_BUF_SIZE must == niEMAC_DATA_BUFFER_SIZE"
-    #endif
-
     #if ipconfigIS_DISABLED( ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM )
         #warning "Consider enabling ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM for NetworkInterface"
     #endif
@@ -254,15 +250,15 @@
 #define niEMAC_DATA_BUFFER_SIZE          ( ( ipTOTAL_ETHERNET_FRAME_SIZE + niEMAC_DATA_ALIGNMENT_MASK ) & ~niEMAC_DATA_ALIGNMENT_MASK )
 #define niEMAC_TOTAL_BUFFER_SIZE         ( ( ( niEMAC_DATA_BUFFER_SIZE + ipBUFFER_PADDING ) + niEMAC_BUF_ALIGNMENT_MASK ) & ~niEMAC_BUF_ALIGNMENT_MASK )
 
+#define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG
+
 #if defined( niEMAC_STM32FX )
 
-/* Note: ETH_DMA_RX_BUFFER_UNAVAILABLE_FLAG is incorrectly defined in HAL ETH Driver as of F7 V1.17.1 && F4 V1.28.0 */
-    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_RBUS
     #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMASR_TBUS
     #define niEMAC_DMA_ERROR_MASK                    HAL_ETH_ERROR_DMA
     #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACA1HR_AE
 
-/* Note: ETH_CTRLPACKETS_BLOCK_ALL is incorrectly defined in HAL ETH Driver as of F7 V1.17.1 && F4 V1.28.0 */
+/* F4 and F7 do not provide the common control-packet filter aliases. */
     #undef ETH_CTRLPACKETS_BLOCK_ALL
     #define ETH_CTRLPACKETS_BLOCK_ALL    ETH_MACFFR_PCF_BlockAll
 
@@ -286,7 +282,6 @@
 
 #elif defined( niEMAC_STM32HX )
 
-    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACSR_RBU
     #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACSR_TBU
     #define niEMAC_DMA_ERROR_MASK                    HAL_ETH_ERROR_DMA
     #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACA1HR_AE
@@ -296,7 +291,6 @@
 
 #elif defined( niEMAC_STM32NX )
 
-    #define niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACxSR_RBU
     #define niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG    ETH_DMACxSR_TBU
     #define niEMAC_DMA_ERROR_MASK                    ( HAL_ETH_ERROR_DMA_CH0 | HAL_ETH_ERROR_DMA_CH1 )
     #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACAxHR_AE
@@ -671,7 +665,7 @@ static BaseType_t prvNetworkInterfaceInitialise( NetworkInterface_t * pxInterfac
 
         case eMacEthStart:
 
-            if( pxEthHandle->gState != HAL_ETH_STATE_STARTED )
+            if( HAL_ETH_GetState( pxEthHandle ) != HAL_ETH_STATE_STARTED )
             {
                 if( HAL_ETH_Start_IT( pxEthHandle ) != HAL_OK )
                 {
@@ -725,7 +719,7 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
             break;
         }
 
-        if( ( xMacInitStatus != eMacInitComplete ) || ( pxEthHandle->gState != HAL_ETH_STATE_STARTED ) )
+        if( ( xMacInitStatus != eMacInitComplete ) || ( HAL_ETH_GetState( pxEthHandle ) != HAL_ETH_STATE_STARTED ) )
         {
             FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: Interface Not Started\n" ) );
             break;
@@ -819,9 +813,9 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
         else
         {
             ( void ) xSemaphoreGive( xTxDescSem );
-            configASSERT( pxEthHandle->gState == HAL_ETH_STATE_STARTED );
+            configASSERT( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED );
             /* Should be impossible if semaphores are correctly implemented */
-            configASSERT( ( pxEthHandle->ErrorCode & HAL_ETH_ERROR_BUSY ) == 0 );
+            configASSERT( ( HAL_ETH_GetError( pxEthHandle ) & HAL_ETH_ERROR_BUSY ) == 0 );
         }
 
         ( void ) xSemaphoreGive( xTxMutex );
@@ -891,7 +885,7 @@ static BaseType_t prvNetworkInterfaceInput( ETH_HandleTypeDef * pxEthHandle,
     #endif
     NetworkBufferDescriptor_t * pxCurDescriptor = NULL;
 
-    if( ( xMacInitStatus == eMacInitComplete ) && ( pxEthHandle->gState == HAL_ETH_STATE_STARTED ) )
+    if( ( xMacInitStatus == eMacInitComplete ) && ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED ) )
     {
         for( uint32_t ulChannel = 0; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
         {
@@ -985,9 +979,9 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
             if( ( ulISREvents & eMacEventErrEth ) != 0 )
             {
-                configASSERT( ( pxEthHandle->ErrorCode & HAL_ETH_ERROR_PARAM ) == 0 );
+                configASSERT( ( HAL_ETH_GetError( pxEthHandle ) & HAL_ETH_ERROR_PARAM ) == 0 );
 
-                if( pxEthHandle->gState == HAL_ETH_STATE_ERROR )
+                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
                 {
                     /* Recover from critical error */
                     ( void ) HAL_ETH_Init( pxEthHandle );
@@ -1004,13 +998,13 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
         {
             if( prvGetPhyLinkStatus( pxInterface ) != pdFALSE )
             {
-                if( pxEthHandle->gState == HAL_ETH_STATE_ERROR )
+                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
                 {
                     /* Recover from critical error */
                     ( void ) HAL_ETH_Init( pxEthHandle );
                 }
 
-                if( pxEthHandle->gState == HAL_ETH_STATE_READY )
+                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_READY )
                 {
                     /* Link was down or critical error occurred */
                     if( prvMacUpdateConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
@@ -1122,10 +1116,6 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
     pxEthHandle->Init.RxBuffLen = niEMAC_DATA_BUFFER_SIZE;
     /* configASSERT( pxEthHandle->Init.RxBuffLen <= ETH_MAX_PACKET_SIZE ); */
     configASSERT( pxEthHandle->Init.RxBuffLen % 4U == 0 );
-    #if ( defined( niEMAC_STM32FX ) && defined( ETH_RX_BUF_SIZE ) )
-        configASSERT( pxEthHandle->Init.RxBuffLen == ETH_RX_BUF_SIZE );
-    #endif
-
     #if defined( niEMAC_STM32NX )
         static ETH_DMADescTypeDef xDMADescTx[ ETH_DMA_TX_CH_CNT ][ ETH_TX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_TX_DESC_SECTION ) ) );
         static ETH_DMADescTypeDef xDMADescRx[ ETH_DMA_RX_CH_CNT ][ ETH_RX_DESC_CNT ] __ALIGNED( niEMAC_DATA_ALIGNMENT ) __attribute__( ( section( niEMAC_RX_DESC_SECTION ) ) );
@@ -1262,7 +1252,7 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
     xFilterConfig.SrcAddrFiltering = DISABLE;
     xFilterConfig.SrcAddrInverseFiltering = DISABLE;
     xFilterConfig.ControlPacketsFilter = ETH_CTRLPACKETS_BLOCK_ALL;
-    xFilterConfig.BroadcastFilter = ENABLE;
+    xFilterConfig.BroadcastFilter = DISABLE;
     xFilterConfig.PassAllMulticast = DISABLE;
     xFilterConfig.DestAddrInverseFiltering = DISABLE;
     xFilterConfig.HashMulticast = ENABLE;
@@ -1734,23 +1724,43 @@ static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle )
 {
     if( xSemaphoreTake( xTxMutex, pdMS_TO_TICKS( niEMAC_TX_MAX_BLOCK_TIME_MS ) ) != pdFALSE )
     {
+        uint32_t ulBuffersReleased = 0U;
+
         #if defined( niEMAC_STM32NX )
             pxEthHandle->TxOpCH = niEMAC_DMA_CHANNEL_INDEX;
         #endif
-        ( void ) HAL_ETH_ReleaseTxPacket( pxEthHandle );
+
+        /* Each transmission consumes one HAL buffer and one semaphore slot. */
+        const uint32_t ulBuffersBeforeRelease = HAL_ETH_GetTxBuffersNumber( pxEthHandle );
+        const HAL_StatusTypeDef xReleaseStatus = HAL_ETH_ReleaseTxPacket( pxEthHandle );
+        const uint32_t ulBuffersAfterRelease = HAL_ETH_GetTxBuffersNumber( pxEthHandle );
+
+        configASSERT( xReleaseStatus == HAL_OK );
+        configASSERT( ulBuffersAfterRelease <= ulBuffersBeforeRelease );
+
+        if( ( xReleaseStatus == HAL_OK ) && ( ulBuffersAfterRelease <= ulBuffersBeforeRelease ) )
+        {
+            ulBuffersReleased = ulBuffersBeforeRelease - ulBuffersAfterRelease;
+        }
+
+        for( uint32_t ulIndex = 0U; ulIndex < ulBuffersReleased; ulIndex++ )
+        {
+            const BaseType_t xGiveResult = xSemaphoreGive( xTxDescSem );
+
+            configASSERT( xGiveResult == pdTRUE );
+
+            if( xGiveResult != pdTRUE )
+            {
+                break;
+            }
+        }
+
         ( void ) xSemaphoreGive( xTxMutex );
     }
     else
     {
         FreeRTOS_debug_printf( ( "prvReleaseTxPacket: Failed\n" ) );
     }
-
-    /* TODO: Is it possible for the semaphore and BuffersInUse to get out of sync? */
-
-    /* while( ETH_TX_DESC_CNT - uxQueueMessagesWaiting( ( QueueHandle_t ) xTxDescSem ) > pxEthHandle->TxDescList.BuffersInUse )
-     * {
-     *  ( void ) xSemaphoreGive( xTxDescSem );
-     * } */
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1760,7 +1770,7 @@ static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
 {
     BaseType_t xResult = pdFALSE;
 
-    if( pxEthHandle->gState == HAL_ETH_STATE_STARTED )
+    if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
     {
         ( void ) HAL_ETH_Stop_IT( pxEthHandle );
     }
@@ -1968,17 +1978,18 @@ void niEMAC_ETH_IRQ_HANDLER( void )
 void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
 {
     eMAC_IF_EVENT eErrorEvents = eMacEventNone;
+    const uint32_t ulErrorCode = HAL_ETH_GetError( pxEthHandle );
 
-    if( pxEthHandle->gState == HAL_ETH_STATE_ERROR )
+    if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
     {
         /* Fatal bus error occurred */
         eErrorEvents |= eMacEventErrEth;
     }
 
-    if( ( pxEthHandle->ErrorCode & niEMAC_DMA_ERROR_MASK ) != 0 )
+    if( ( ulErrorCode & niEMAC_DMA_ERROR_MASK ) != 0 )
     {
         eErrorEvents |= eMacEventErrDma;
-        const uint32_t ulDmaError = pxEthHandle->DMAErrorCode;
+        const uint32_t ulDmaError = HAL_ETH_GetDMAError( pxEthHandle );
 
         if( ( ulDmaError & niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
         {
@@ -1991,7 +2002,7 @@ void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
         }
     }
 
-    if( ( pxEthHandle->ErrorCode & HAL_ETH_ERROR_MAC ) != 0 )
+    if( ( ulErrorCode & HAL_ETH_ERROR_MAC ) != 0 )
     {
         eErrorEvents |= eMacEventErrMac;
     }
@@ -2141,7 +2152,6 @@ void HAL_ETH_TxFreeCallback( uint32_t * pulBuff )
     NetworkBufferDescriptor_t * const pxNetworkBuffer = ( NetworkBufferDescriptor_t * ) pulBuff;
 
     prvReleaseNetworkBufferDescriptor( pxNetworkBuffer );
-    ( void ) xSemaphoreGive( xTxDescSem );
 }
 
 /*---------------------------------------------------------------------------*/
