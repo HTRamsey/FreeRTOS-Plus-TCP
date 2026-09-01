@@ -112,7 +112,12 @@
     #define niEMAC_TX_DESC_LIST( pxHandle, ulChannel )    ( ( pxHandle )->TxDescList )
 #endif /* if defined( niEMAC_STM32NX ) */
 
-#if defined( niEMAC_STM32FX )
+#if defined( STM32F1 )
+    #define niEMAC_ETH_CLOCKS_ENABLED()               \
+    ( ( __HAL_RCC_ETHMAC_IS_CLK_ENABLED() != 0 ) &&   \
+      ( __HAL_RCC_ETHMACTX_IS_CLK_ENABLED() != 0 ) && \
+      ( __HAL_RCC_ETHMACRX_IS_CLK_ENABLED() != 0 ) )
+#elif defined( niEMAC_STM32FX )
     #define niEMAC_ETH_CLOCKS_ENABLED()    ( __HAL_RCC_ETH_IS_CLK_ENABLED() != 0 )
 #elif defined( STM32H5 )
     #define niEMAC_ETH_CLOCKS_ENABLED()            \
@@ -130,34 +135,110 @@
       ( __HAL_RCC_ETH1MAC_IS_CLK_ENABLED() != 0 ) && \
       ( __HAL_RCC_ETH1TX_IS_CLK_ENABLED() != 0 ) &&  \
       ( __HAL_RCC_ETH1RX_IS_CLK_ENABLED() != 0 ) )
-#endif /* if defined( niEMAC_STM32FX ) */
+#endif /* if defined( STM32F1 ) */
 
-#define niEMAC_TASK_NAME                  "EMAC_STM32"
-#define niEMAC_TASK_PRIORITY              ( configMAX_PRIORITIES - 1 )
-#define niEMAC_TASK_STACK_SIZE            ( 4U * configMINIMAL_STACK_SIZE )
+#ifndef niEMAC_HANDLER_TASK_NAME
+    #define niEMAC_HANDLER_TASK_NAME    "EMAC_STM32"
+#endif
 
-#define niEMAC_TX_DESC_SECTION            ".TxDescripSection"
-#define niEMAC_RX_DESC_SECTION            ".RxDescripSection"
-#define niEMAC_BUFFERS_SECTION            ".EthBuffersSection"
+#ifndef niEMAC_HANDLER_TASK_PRIORITY
+    #define niEMAC_HANDLER_TASK_PRIORITY    ( configMAX_PRIORITIES - 1 )
+#endif
 
-#define niEMAC_TASK_MAX_BLOCK_TIME_MS     100U
-#define niEMAC_TX_MAX_BLOCK_TIME_MS       20U
-#define niEMAC_RX_MAX_BLOCK_TIME_MS       20U
-#define niEMAC_DESCRIPTOR_WAIT_TIME_MS    20U
+#ifndef niEMAC_HANDLER_TASK_STACK_SIZE
+    #ifdef configEMAC_TASK_STACK_SIZE
+        #define niEMAC_HANDLER_TASK_STACK_SIZE    configEMAC_TASK_STACK_SIZE
+    #else
+        #define niEMAC_HANDLER_TASK_STACK_SIZE    ( 4U * configMINIMAL_STACK_SIZE )
+    #endif
+#endif
+
+#ifndef niEMAC_TX_DESC_SECTION
+    #define niEMAC_TX_DESC_SECTION    ".TxDescripSection"
+#endif
+
+#ifndef niEMAC_RX_DESC_SECTION
+    #define niEMAC_RX_DESC_SECTION    ".RxDescripSection"
+#endif
+
+#ifndef niEMAC_BUFFERS_SECTION
+    #define niEMAC_BUFFERS_SECTION    ".EthBuffersSection"
+#endif
+
+#ifndef niEMAC_TASK_MAX_BLOCK_TIME_MS
+    #define niEMAC_TASK_MAX_BLOCK_TIME_MS    100U
+#endif
+
+#ifndef niEMAC_TX_MAX_BLOCK_TIME_MS
+    #define niEMAC_TX_MAX_BLOCK_TIME_MS    20U
+#endif
+
+#ifndef niEMAC_RX_MAX_BLOCK_TIME_MS
+    #define niEMAC_RX_MAX_BLOCK_TIME_MS    20U
+#endif
+
+#ifndef niDESCRIPTOR_WAIT_TIME_MS
+    #define niDESCRIPTOR_WAIT_TIME_MS    20U
+#endif
 
 #define niEMAC_TX_MUTEX_NAME              "EMAC_TxMutex"
 #define niEMAC_TX_DESC_SEM_NAME           "EMAC_TxDescSem"
 
-#define niEMAC_AUTO_NEGOTIATION           ipconfigENABLE
-#define niEMAC_USE_100MB                  ( ipconfigENABLE && ipconfigIS_DISABLED( niEMAC_AUTO_NEGOTIATION ) )
-#define niEMAC_USE_FULL_DUPLEX            ( ipconfigENABLE && ipconfigIS_DISABLED( niEMAC_AUTO_NEGOTIATION ) )
-#define niEMAC_AUTO_CROSS                 ( ipconfigENABLE && ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION ) )
-#define niEMAC_CROSSED_LINK               ( ipconfigENABLE && ipconfigIS_DISABLED( niEMAC_AUTO_CROSS ) )
+#ifndef ipconfigETHERNET_AN_ENABLE
+    #define ipconfigETHERNET_AN_ENABLE    ipconfigENABLE
+#endif
 
-#define niEMAC_USE_RMII                   ipconfigENABLE
+#ifndef ipconfigETHERNET_USE_100MB
+    #define ipconfigETHERNET_USE_100MB    ( ipconfigENABLE && ipconfigIS_DISABLED( ipconfigETHERNET_AN_ENABLE ) )
+#endif
+
+#ifndef ipconfigETHERNET_USE_FULL_DUPLEX
+    #define ipconfigETHERNET_USE_FULL_DUPLEX    ( ipconfigENABLE && ipconfigIS_DISABLED( ipconfigETHERNET_AN_ENABLE ) )
+#endif
+
+#ifndef ipconfigETHERNET_AUTO_CROSS_ENABLE
+    #define ipconfigETHERNET_AUTO_CROSS_ENABLE    ( ipconfigENABLE && ipconfigIS_ENABLED( ipconfigETHERNET_AN_ENABLE ) )
+#endif
+
+#ifndef ipconfigETHERNET_CROSSED_LINK
+    #define ipconfigETHERNET_CROSSED_LINK    ( ipconfigENABLE && ipconfigIS_DISABLED( ipconfigETHERNET_AUTO_CROSS_ENABLE ) )
+#endif
+
+#ifndef ipconfigUSE_RMII
+    #define ipconfigUSE_RMII    ipconfigENABLE
+#endif
 
 #ifndef iptraceEMAC_TASK_STARTING
-    #define iptraceEMAC_TASK_STARTING()    do {} while( 0 )
+    #ifdef ipconfigEMAC_TASK_HOOK
+        #define iptraceEMAC_TASK_STARTING()    ipconfigEMAC_TASK_HOOK()
+    #else
+        #define iptraceEMAC_TASK_STARTING()    do {} while( 0 )
+    #endif
+#endif
+
+#ifndef iptraceSTM32_ETH_RX_DESC_USAGE
+    #define iptraceSTM32_ETH_RX_DESC_USAGE( ulChannel, uxDescriptorsUsed ) \
+    do {                                                                    \
+        ( void ) ( ulChannel );                                             \
+        ( void ) ( uxDescriptorsUsed );                                     \
+    } while( 0 )
+#endif
+
+#ifndef iptraceSTM32_ETH_TX_DESC_USAGE
+    #define iptraceSTM32_ETH_TX_DESC_USAGE( ulChannel, uxDescriptorsUsed ) \
+    do {                                                                    \
+        ( void ) ( ulChannel );                                             \
+        ( void ) ( uxDescriptorsUsed );                                     \
+    } while( 0 )
+#endif
+
+#ifndef iptraceSTM32_ETH_FATAL_ERROR
+    #define iptraceSTM32_ETH_FATAL_ERROR( ulHalErrorCode, ulDmaErrorCode, ulMacErrorCode ) \
+    do {                                                                                       \
+        ( void ) ( ulHalErrorCode );                                                           \
+        ( void ) ( ulDmaErrorCode );                                                           \
+        ( void ) ( ulMacErrorCode );                                                           \
+    } while( 0 )
 #endif
 
 /* DMA descriptor sections must always be non-cacheable. Packet buffers may
@@ -195,6 +276,34 @@
 
 #if ipconfigIS_DISABLED( ipconfigZERO_COPY_RX_DRIVER )
     #error "ipconfigZERO_COPY_RX_DRIVER must be enabled for NetworkInterface"
+#endif
+
+#if ( ( ipconfigETHERNET_AN_ENABLE != ipconfigENABLE ) && ( ipconfigETHERNET_AN_ENABLE != ipconfigDISABLE ) )
+    #error "ipconfigETHERNET_AN_ENABLE must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigETHERNET_USE_100MB != ipconfigENABLE ) && ( ipconfigETHERNET_USE_100MB != ipconfigDISABLE ) )
+    #error "ipconfigETHERNET_USE_100MB must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigETHERNET_USE_FULL_DUPLEX != ipconfigENABLE ) && ( ipconfigETHERNET_USE_FULL_DUPLEX != ipconfigDISABLE ) )
+    #error "ipconfigETHERNET_USE_FULL_DUPLEX must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigETHERNET_AUTO_CROSS_ENABLE != ipconfigENABLE ) && ( ipconfigETHERNET_AUTO_CROSS_ENABLE != ipconfigDISABLE ) )
+    #error "ipconfigETHERNET_AUTO_CROSS_ENABLE must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigETHERNET_CROSSED_LINK != ipconfigENABLE ) && ( ipconfigETHERNET_CROSSED_LINK != ipconfigDISABLE ) )
+    #error "ipconfigETHERNET_CROSSED_LINK must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigUSE_RMII != ipconfigENABLE ) && ( ipconfigUSE_RMII != ipconfigDISABLE ) )
+    #error "ipconfigUSE_RMII must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( niEMAC_USE_MPU != ipconfigENABLE ) && ( niEMAC_USE_MPU != ipconfigDISABLE ) )
+    #error "niEMAC_USE_MPU must be ipconfigENABLE or ipconfigDISABLE"
 #endif
 
 #if ( ipconfigNETWORK_MTU < ETH_MIN_PAYLOAD ) || ( ipconfigNETWORK_MTU > ETH_MAX_PAYLOAD )
@@ -389,10 +498,10 @@ static __NO_RETURN portTASK_FUNCTION_PROTO( prvEMACHandlerTask,
 static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface );
 
 /* EMAC Recovery */
-static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle );
+static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle,
+                                 uint32_t ulMacErrorCode );
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
-                                               EthernetPhy_t * pxPhyObject,
-                                               NetworkInterface_t * pxInterface );
+                                               EthernetPhy_t * pxPhyObject );
 
 /* EMAC Init */
 static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
@@ -640,24 +749,24 @@ static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
     {
         const PhyProperties_t xPhyProperties =
         {
-            #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
+            #if ipconfigIS_ENABLED( ipconfigETHERNET_AN_ENABLE )
                 .ucSpeed  = PHY_SPEED_AUTO,
                 .ucDuplex = PHY_DUPLEX_AUTO,
             #else
-                .ucSpeed  = ipconfigIS_ENABLED( niEMAC_USE_100MB ) ? PHY_SPEED_100 : PHY_SPEED_10,
-                .ucDuplex = ipconfigIS_ENABLED( niEMAC_USE_FULL_DUPLEX ) ? PHY_DUPLEX_FULL : PHY_DUPLEX_HALF,
+                .ucSpeed  = ipconfigIS_ENABLED( ipconfigETHERNET_USE_100MB ) ? PHY_SPEED_100 : PHY_SPEED_10,
+                .ucDuplex = ipconfigIS_ENABLED( ipconfigETHERNET_USE_FULL_DUPLEX ) ? PHY_DUPLEX_FULL : PHY_DUPLEX_HALF,
             #endif
 
-            #if ipconfigIS_ENABLED( niEMAC_AUTO_CROSS )
+            #if ipconfigIS_ENABLED( ipconfigETHERNET_AUTO_CROSS_ENABLE )
                 .ucMDI_X  = PHY_MDIX_AUTO,
-            #elif ipconfigIS_ENABLED( niEMAC_CROSSED_LINK )
+            #elif ipconfigIS_ENABLED( ipconfigETHERNET_CROSSED_LINK )
                 .ucMDI_X  = PHY_MDIX_CROSSED,
             #else
                 .ucMDI_X  = PHY_MDIX_DIRECT,
             #endif
         };
 
-        #if ipconfigIS_DISABLED( niEMAC_AUTO_NEGOTIATION )
+        #if ipconfigIS_DISABLED( ipconfigETHERNET_AN_ENABLE )
             pxPhyObject->xPhyPreferences.ucSpeed = xPhyProperties.ucSpeed;
             pxPhyObject->xPhyPreferences.ucDuplex = xPhyProperties.ucDuplex;
             pxPhyObject->xPhyProperties = xPhyProperties;
@@ -888,7 +997,7 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
         xTxConfig.TxBuffer = &xTxBuffer;
         xTxConfig.Length = xTxBuffer.len;
 
-        if( xSemaphoreTake( xTxDescSem, pdMS_TO_TICKS( niEMAC_DESCRIPTOR_WAIT_TIME_MS ) ) == pdFALSE )
+        if( xSemaphoreTake( xTxDescSem, pdMS_TO_TICKS( niDESCRIPTOR_WAIT_TIME_MS ) ) == pdFALSE )
         {
             FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: No Descriptors Available\n" ) );
             break;
@@ -1133,6 +1242,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
     {
         BaseType_t xResult = pdFALSE;
         uint32_t ulISREvents = 0U;
+        uint32_t ulMacErrorCode = 0U;
 
         if( xTaskNotifyWait( 0U, eMacEventAll, &ulISREvents, pdMS_TO_TICKS( niEMAC_TASK_MAX_BLOCK_TIME_MS ) ) == pdTRUE )
         {
@@ -1180,22 +1290,19 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
             if( ( ulISREvents & eMacEventErrMac ) != 0 )
             {
-                uint32_t ulMacErrorCode;
-
                 taskENTER_CRITICAL();
                 ulMacErrorCode = ulPendingMacErrorCode;
                 ulPendingMacErrorCode = 0U;
                 taskEXIT_CRITICAL();
 
-                if( ulMacErrorCode != 0U )
-                {
-                    FreeRTOS_debug_printf( ( "prvEMACHandlerTask: MAC error 0x%08lX\n",
-                                             ( unsigned long ) ulMacErrorCode ) );
-                }
-
                 if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
                 {
                     ulISREvents |= eMacEventErrEth;
+                }
+                else if( ulMacErrorCode != 0U )
+                {
+                    FreeRTOS_debug_printf( ( "prvEMACHandlerTask: MAC error 0x%08lX\n",
+                                             ( unsigned long ) ulMacErrorCode ) );
                 }
             }
 
@@ -1204,7 +1311,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
                 if( ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR ) &&
                     ( xRecoveryRequired == pdFALSE ) )
                 {
-                    prvReportFatalError( pxEthHandle );
+                    prvReportFatalError( pxEthHandle, ulMacErrorCode );
                     xRecoveryRequired = pdTRUE;
                 }
             }
@@ -1214,7 +1321,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
         {
             if( xRecoveryRequired == pdFALSE )
             {
-                prvReportFatalError( pxEthHandle );
+                prvReportFatalError( pxEthHandle, ulMacErrorCode );
             }
 
             xRecoveryRequired = pdTRUE;
@@ -1222,7 +1329,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
         if( xRecoveryRequired != pdFALSE )
         {
-            if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject, pxInterface ) != pdFALSE )
+            if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject ) != pdFALSE )
             {
                 if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
                 {
@@ -1332,24 +1439,24 @@ static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface )
     if( ( xEMACTaskHandle == NULL ) && ( xTxMutex != NULL ) && ( xTxDescSem != NULL ) )
     {
         #if ipconfigIS_ENABLED( configSUPPORT_STATIC_ALLOCATION )
-            static StackType_t uxEMACTaskStack[ niEMAC_TASK_STACK_SIZE ];
+            static StackType_t uxEMACTaskStack[ niEMAC_HANDLER_TASK_STACK_SIZE ];
             static StaticTask_t xEMACTaskTCB;
             xEMACTaskHandle = xTaskCreateStatic(
                 prvEMACHandlerTask,
-                niEMAC_TASK_NAME,
-                niEMAC_TASK_STACK_SIZE,
+                niEMAC_HANDLER_TASK_NAME,
+                niEMAC_HANDLER_TASK_STACK_SIZE,
                 ( void * ) pxInterface,
-                niEMAC_TASK_PRIORITY,
+                niEMAC_HANDLER_TASK_PRIORITY,
                 uxEMACTaskStack,
                 &xEMACTaskTCB
                 );
         #else /* if ipconfigIS_ENABLED( configSUPPORT_STATIC_ALLOCATION ) */
             ( void ) xTaskCreate(
                 prvEMACHandlerTask,
-                niEMAC_TASK_NAME,
-                niEMAC_TASK_STACK_SIZE,
+                niEMAC_HANDLER_TASK_NAME,
+                niEMAC_HANDLER_TASK_STACK_SIZE,
                 ( void * ) pxInterface,
-                niEMAC_TASK_PRIORITY,
+                niEMAC_HANDLER_TASK_PRIORITY,
                 &xEMACTaskHandle
                 );
         #endif /* if ipconfigIS_ENABLED( configSUPPORT_STATIC_ALLOCATION ) */
@@ -1369,7 +1476,8 @@ static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface )
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
-static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle )
+static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle,
+                                 uint32_t ulMacErrorCode )
 {
     uint32_t ulHalErrorCode;
     uint32_t ulDmaErrorCode;
@@ -1377,8 +1485,10 @@ static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle )
     taskENTER_CRITICAL();
     ulHalErrorCode = ulPendingFatalHalErrorCode;
     ulDmaErrorCode = ulPendingFatalDmaErrorCode;
+    ulMacErrorCode |= ulPendingMacErrorCode;
     ulPendingFatalHalErrorCode = 0U;
     ulPendingFatalDmaErrorCode = 0U;
+    ulPendingMacErrorCode = 0U;
     taskEXIT_CRITICAL();
 
     if( ulHalErrorCode == 0U )
@@ -1392,11 +1502,14 @@ static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle )
         ulDmaErrorCode = HAL_ETH_GetDMAError( pxEthHandle );
     }
 
-    if( ( ulHalErrorCode | ulDmaErrorCode ) != 0U )
+    iptraceSTM32_ETH_FATAL_ERROR( ulHalErrorCode, ulDmaErrorCode, ulMacErrorCode );
+
+    if( ( ulHalErrorCode | ulDmaErrorCode | ulMacErrorCode ) != 0U )
     {
-        FreeRTOS_debug_printf( ( "prvReportFatalError: HAL error 0x%08lX, DMA error 0x%08lX\n",
+        FreeRTOS_debug_printf( ( "prvReportFatalError: HAL error 0x%08lX, DMA error 0x%08lX, MAC error 0x%08lX\n",
                                  ( unsigned long ) ulHalErrorCode,
-                                 ( unsigned long ) ulDmaErrorCode ) );
+                                 ( unsigned long ) ulDmaErrorCode,
+                                 ( unsigned long ) ulMacErrorCode ) );
     }
     else
     {
@@ -1409,8 +1522,7 @@ static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle )
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
-                                               EthernetPhy_t * pxPhyObject,
-                                               NetworkInterface_t * pxInterface )
+                                               EthernetPhy_t * pxPhyObject )
 {
     BaseType_t xResult = pdFALSE;
     NetworkBufferDescriptor_t * pxTxPackets[ ETH_TX_DESC_CNT ] = { NULL };
@@ -1627,7 +1739,7 @@ static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
         }
     }
 
-    #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
+    #if ipconfigIS_ENABLED( ipconfigETHERNET_AN_ENABLE )
         ( void ) xPhyStartAutoNegotiation( pxPhyObject, xPhyGetMask( pxPhyObject ) );
     #else
         ( void ) xPhyFixedValue( pxPhyObject, xPhyGetMask( pxPhyObject ) );
@@ -1656,7 +1768,7 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
     #endif
 
     pxEthHandle->Instance = niEMAC_ETH_INSTANCE;
-    pxEthHandle->Init.MediaInterface = ipconfigIS_ENABLED( niEMAC_USE_RMII ) ? HAL_ETH_RMII_MODE : HAL_ETH_MII_MODE;
+    pxEthHandle->Init.MediaInterface = ipconfigIS_ENABLED( ipconfigUSE_RMII ) ? HAL_ETH_RMII_MODE : HAL_ETH_MII_MODE;
     pxEthHandle->Init.RxBuffLen = niEMAC_DATA_BUFFER_SIZE;
 
     /* RxBuffLen includes alignment padding, so compare the unpadded frame size
@@ -2520,16 +2632,10 @@ void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
 
 void HAL_ETH_RxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 {
-    static size_t uxMostRXDescsUsed = 0U;
-
     for( uint32_t ulChannel = 0; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
     {
-        const size_t uxRxUsed = niEMAC_RX_DESC_LIST( pxEthHandle, ulChannel ).RxDescCnt;
-
-        if( uxMostRXDescsUsed < uxRxUsed )
-        {
-            uxMostRXDescsUsed = uxRxUsed;
-        }
+        const size_t uxRxDescriptorsUsed = niEMAC_RX_DESC_LIST( pxEthHandle, ulChannel ).RxDescCnt;
+        iptraceSTM32_ETH_RX_DESC_USAGE( ulChannel, uxRxDescriptorsUsed );
     }
 
     iptraceNETWORK_INTERFACE_RECEIVE();
@@ -2546,16 +2652,10 @@ void HAL_ETH_RxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 
 void HAL_ETH_TxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 {
-    static size_t uxMostTXDescsUsed = 0U;
-
     for( uint32_t ulChannel = 0; ulChannel < niEMAC_TX_CHANNEL_COUNT; ulChannel++ )
     {
-        const size_t uxTxUsed = niEMAC_TX_DESC_LIST( pxEthHandle, ulChannel ).BuffersInUse;
-
-        if( uxMostTXDescsUsed < uxTxUsed )
-        {
-            uxMostTXDescsUsed = uxTxUsed;
-        }
+        const size_t uxTxDescriptorsUsed = niEMAC_TX_DESC_LIST( pxEthHandle, ulChannel ).BuffersInUse;
+        iptraceSTM32_ETH_TX_DESC_USAGE( ulChannel, uxTxDescriptorsUsed );
     }
 
     iptraceNETWORK_INTERFACE_TRANSMIT();
@@ -2581,7 +2681,7 @@ void HAL_ETH_RxAllocateCallback( uint8_t ** ppucBuff )
         return;
     }
 
-    const NetworkBufferDescriptor_t * pxBufferDescriptor = pxGetNetworkBufferWithDescriptor( niEMAC_DATA_BUFFER_SIZE, pdMS_TO_TICKS( niEMAC_DESCRIPTOR_WAIT_TIME_MS ) );
+    const NetworkBufferDescriptor_t * pxBufferDescriptor = pxGetNetworkBufferWithDescriptor( niEMAC_DATA_BUFFER_SIZE, pdMS_TO_TICKS( niDESCRIPTOR_WAIT_TIME_MS ) );
 
     if( pxBufferDescriptor != NULL )
     {
