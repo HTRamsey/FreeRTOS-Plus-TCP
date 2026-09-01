@@ -389,6 +389,7 @@ static __NO_RETURN portTASK_FUNCTION_PROTO( prvEMACHandlerTask,
 static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface );
 
 /* EMAC Recovery */
+static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle );
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
                                                EthernetPhy_t * pxPhyObject,
                                                NetworkInterface_t * pxInterface );
@@ -472,6 +473,9 @@ static SemaphoreHandle_t xTxMutex = NULL, xTxDescSem = NULL;
 
 static volatile BaseType_t xSwitchRequired = pdFALSE;
 static volatile BaseType_t xDropCurrentRxFrame = pdFALSE;
+static volatile uint32_t ulPendingFatalHalErrorCode = 0U;
+static volatile uint32_t ulPendingFatalDmaErrorCode = 0U;
+static volatile uint32_t ulPendingMacErrorCode = 0U;
 
 static eMAC_INIT_STATUS_TYPE xMacInitStatus = eMacEthInit;
 
@@ -1174,18 +1178,33 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
                 }
             }
 
-            if( ( ( ulISREvents & eMacEventErrMac ) != 0 ) &&
-                ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR ) )
+            if( ( ulISREvents & eMacEventErrMac ) != 0 )
             {
-                ulISREvents |= eMacEventErrEth;
+                uint32_t ulMacErrorCode;
+
+                taskENTER_CRITICAL();
+                ulMacErrorCode = ulPendingMacErrorCode;
+                ulPendingMacErrorCode = 0U;
+                taskEXIT_CRITICAL();
+
+                if( ulMacErrorCode != 0U )
+                {
+                    FreeRTOS_debug_printf( ( "prvEMACHandlerTask: MAC error 0x%08lX\n",
+                                             ( unsigned long ) ulMacErrorCode ) );
+                }
+
+                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
+                {
+                    ulISREvents |= eMacEventErrEth;
+                }
             }
 
             if( ( ulISREvents & eMacEventErrEth ) != 0 )
             {
-                configASSERT( ( HAL_ETH_GetError( pxEthHandle ) & HAL_ETH_ERROR_PARAM ) == 0 );
-
-                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
+                if( ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR ) &&
+                    ( xRecoveryRequired == pdFALSE ) )
                 {
+                    prvReportFatalError( pxEthHandle );
                     xRecoveryRequired = pdTRUE;
                 }
             }
@@ -1193,6 +1212,11 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
         if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
         {
+            if( xRecoveryRequired == pdFALSE )
+            {
+                prvReportFatalError( pxEthHandle );
+            }
+
             xRecoveryRequired = pdTRUE;
         }
 
@@ -1343,6 +1367,45 @@ static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface )
 /*===========================================================================*/
 /*                               EMAC Recovery                               */
 /*===========================================================================*/
+/*---------------------------------------------------------------------------*/
+
+static void prvReportFatalError( ETH_HandleTypeDef * pxEthHandle )
+{
+    uint32_t ulHalErrorCode;
+    uint32_t ulDmaErrorCode;
+
+    taskENTER_CRITICAL();
+    ulHalErrorCode = ulPendingFatalHalErrorCode;
+    ulDmaErrorCode = ulPendingFatalDmaErrorCode;
+    ulPendingFatalHalErrorCode = 0U;
+    ulPendingFatalDmaErrorCode = 0U;
+    taskEXIT_CRITICAL();
+
+    if( ulHalErrorCode == 0U )
+    {
+        ulHalErrorCode = HAL_ETH_GetError( pxEthHandle );
+    }
+
+    if( ( ulDmaErrorCode == 0U ) &&
+        ( ( ulHalErrorCode & niEMAC_DMA_ERROR_MASK ) != 0U ) )
+    {
+        ulDmaErrorCode = HAL_ETH_GetDMAError( pxEthHandle );
+    }
+
+    if( ( ulHalErrorCode | ulDmaErrorCode ) != 0U )
+    {
+        FreeRTOS_debug_printf( ( "prvReportFatalError: HAL error 0x%08lX, DMA error 0x%08lX\n",
+                                 ( unsigned long ) ulHalErrorCode,
+                                 ( unsigned long ) ulDmaErrorCode ) );
+    }
+    else
+    {
+        FreeRTOS_debug_printf( ( "prvReportFatalError: HAL entered the error state without an error code\n" ) );
+    }
+
+    configASSERT( ( ulHalErrorCode & HAL_ETH_ERROR_PARAM ) == 0U );
+}
+
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
@@ -2407,31 +2470,41 @@ void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
 {
     eMAC_IF_EVENT eErrorEvents = eMacEventNone;
     const uint32_t ulErrorCode = HAL_ETH_GetError( pxEthHandle );
+    uint32_t ulDmaErrorCode = 0U;
 
     if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
     {
-        /* Fatal bus error occurred */
+        /* A fatal DMA or MAC error requires reinitialization in task context. */
         eErrorEvents |= eMacEventErrEth;
     }
 
     if( ( ulErrorCode & niEMAC_DMA_ERROR_MASK ) != 0 )
     {
         eErrorEvents |= eMacEventErrDma;
-        const uint32_t ulDmaError = HAL_ETH_GetDMAError( pxEthHandle );
+        ulDmaErrorCode = HAL_ETH_GetDMAError( pxEthHandle );
 
-        if( ( ulDmaError & niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
+        if( ( ulDmaErrorCode & niEMAC_DMA_TX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
         {
             eErrorEvents |= eMacEventErrTx;
         }
 
-        if( ( ulDmaError & niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
+        if( ( ulDmaErrorCode & niEMAC_DMA_RX_BUFFER_UNAVAILABLE_FLAG ) != 0 )
         {
             eErrorEvents |= eMacEventErrRx;
         }
     }
 
+    if( ( eErrorEvents & eMacEventErrEth ) != 0 )
+    {
+        /* N6 invokes this callback separately for each DMA channel. */
+        ulPendingFatalHalErrorCode |= ulErrorCode;
+        ulPendingFatalDmaErrorCode |= ulDmaErrorCode;
+    }
+
     if( ( ulErrorCode & HAL_ETH_ERROR_MAC ) != 0 )
     {
+        /* Newer HALs clear MACErrorCode immediately after this callback. */
+        ulPendingMacErrorCode |= HAL_ETH_GetMACError( pxEthHandle );
         eErrorEvents |= eMacEventErrMac;
     }
 
