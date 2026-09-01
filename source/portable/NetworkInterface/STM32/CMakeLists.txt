@@ -6,11 +6,13 @@ endif()
 add_library( freertos_plus_tcp_network_if STATIC )
 
 set( FREERTOS_PLUS_TCP_STM32_IF_DRIVER "None" CACHE STRING "The driver sources to use with STM32 Network interface" )
-set_property( CACHE FREERTOS_PLUS_TCP_STM32_IF_DRIVER PROPERTY STRINGS None F4 F7 H5 H7 H7RS N6 )
+set_property( CACHE FREERTOS_PLUS_TCP_STM32_IF_DRIVER PROPERTY STRINGS None F2 F4 F7 H5 H7 H7RS N6 )
 
 target_sources( freertos_plus_tcp_network_if
   PRIVATE
     NetworkInterface.c
+    $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F2>:
+      Drivers/F2/stm32f2xx_hal_eth.c>
     $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F4>:
       Drivers/F4/stm32f4xx_hal_eth.c>
     $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F7>:
@@ -35,6 +37,8 @@ target_sources( freertos_plus_tcp_network_if
 
 target_include_directories( freertos_plus_tcp_network_if
   PUBLIC
+    $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F2>:
+      Drivers/F2>
     $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F4>:
       Drivers/F4>
     $<$<STREQUAL:${FREERTOS_PLUS_TCP_STM32_IF_DRIVER},F7>:

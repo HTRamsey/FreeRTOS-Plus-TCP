@@ -58,7 +58,9 @@
 #include "phyHandling.h"
 
 /* ST includes. */
-#if defined( STM32F4 )
+#if defined( STM32F2 )
+    #include "stm32f2xx_hal.h"
+#elif defined( STM32F4 )
     #include "stm32f4xx_hal.h"
 #elif defined( STM32F7 )
     #include "stm32f7xx_hal.h"
@@ -70,8 +72,6 @@
     #include "stm32h5xx_hal.h"
 #elif defined( STM32N6 )
     #include "stm32n6xx_hal.h"
-#elif defined( STM32F2 )
-    #error "This NetworkInterface is incompatible with STM32F2 - Use Legacy NetworkInterface"
 #else /* if defined( STM32F4 ) */
     #error "Unknown STM32 Family for NetworkInterface"
 #endif /* if defined( STM32F4 ) */
@@ -82,7 +82,7 @@
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
-#if defined( STM32F7 ) || defined( STM32F4 )
+#if defined( STM32F7 ) || defined( STM32F4 ) || defined( STM32F2 )
     #define niEMAC_STM32FX
 #elif defined( STM32H7 ) || defined( STM32H7RS ) || defined( STM32H5 )
     #define niEMAC_STM32HX
