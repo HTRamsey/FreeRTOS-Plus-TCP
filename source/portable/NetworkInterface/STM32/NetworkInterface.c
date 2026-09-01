@@ -49,9 +49,6 @@
     #include "FreeRTOS_ND.h"
 #endif
 #include "FreeRTOS_Routing.h"
-#if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
-    #include "FreeRTOS_Sockets.h"
-#endif
 #include "NetworkBufferManagement.h"
 #include "NetworkInterface.h"
 #include "phyHandling.h"
@@ -439,12 +436,10 @@ static void prvSendRxEvent( NetworkBufferDescriptor_t * const pxDescriptor );
 static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
                                    NetworkInterface_t * pxInterface,
                                    NetworkBufferDescriptor_t * pxDescriptor );
-#if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
-    static BaseType_t prvPassesPacketFilter( const NetworkBufferDescriptor_t * const pxDescriptor );
-#endif
 
 /* Cache Maintenance Helpers */
 #ifdef niEMAC_CACHEABLE
+    static void prvValidateCacheLineSize( void );
     static uintptr_t prvGetCacheAlignedRange( const void * pvAddress,
                                               size_t uxLength,
                                               size_t * puxAlignedLength );
@@ -494,6 +489,25 @@ static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
 /*---------------------------------------------------------------------------*/
 
 #ifdef niEMAC_CACHEABLE
+
+    static void prvValidateCacheLineSize( void )
+    {
+        const uint32_t ulPreviousCacheSelection = SCB->CSSELR;
+        uint32_t ulCacheLineSize;
+
+        SCB->CSSELR = 0U; /* Select the level-one data or unified cache. */
+        __DSB();
+        ulCacheLineSize = 1UL << ( _FLD2VAL( SCB_CCSIDR_LINESIZE, SCB->CCSIDR ) + 4U );
+        SCB->CSSELR = ulPreviousCacheSelection;
+        __DSB();
+
+        if( ulCacheLineSize != ( uint32_t ) niEMAC_DATA_ALIGNMENT )
+        {
+            configASSERT( pdFALSE );
+        }
+    }
+
+/*---------------------------------------------------------------------------*/
 
     static uintptr_t prvGetCacheAlignedRange( const void * pvAddress,
                                               size_t uxLength,
@@ -1571,6 +1585,13 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
 {
     BaseType_t xResult = pdFALSE;
 
+    #ifdef niEMAC_CACHEABLE
+        if( niEMAC_CACHE_ENABLED )
+        {
+            prvValidateCacheLineSize();
+        }
+    #endif
+
     pxEthHandle->Instance = niEMAC_ETH_INSTANCE;
     pxEthHandle->Init.MediaInterface = ipconfigIS_ENABLED( niEMAC_USE_RMII ) ? HAL_ETH_RMII_MODE : HAL_ETH_MII_MODE;
     pxEthHandle->Init.RxBuffLen = niEMAC_DATA_BUFFER_SIZE;
@@ -2344,7 +2365,7 @@ static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
         }
 
         #if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
-            if( prvPassesPacketFilter( pxDescriptor ) == pdFALSE )
+            if( eConsiderPacketForProcessing( pxDescriptor ) != eProcessBuffer )
             {
                 iptraceETHERNET_RX_EVENT_LOST();
                 FreeRTOS_debug_printf( ( "prvAcceptPacket: Packet discarded\n" ) );
@@ -2357,159 +2378,6 @@ static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
 
     return xResult;
 }
-
-/*---------------------------------------------------------------------------*/
-
-#if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
-
-    static BaseType_t prvPassesPacketFilter( const NetworkBufferDescriptor_t * const pxDescriptor )
-    {
-        const EthernetHeader_t * const pxEthernetHeader = ( const EthernetHeader_t * const ) pxDescriptor->pucEthernetBuffer;
-        const NetworkEndPoint_t * const pxEndPoint = pxDescriptor->pxEndPoint;
-
-        #if ipconfigIS_ENABLED( ipconfigUSE_IPv4 )
-            if( pxEthernetHeader->usFrameType == ipARP_FRAME_TYPE )
-            {
-                return pdTRUE;
-            }
-
-            if( pxEthernetHeader->usFrameType == ipIPv4_FRAME_TYPE )
-            {
-                if( ENDPOINT_IS_IPv4( pxEndPoint ) == pdFALSE )
-                {
-                    return pdFALSE;
-                }
-
-                const IPPacket_t * const pxIPPacket = ( const IPPacket_t * const ) pxDescriptor->pucEthernetBuffer;
-                const IPHeader_t * const pxIPHeader = &( pxIPPacket->xIPHeader );
-                const uint32_t ulDestinationIPAddress = pxIPHeader->ulDestinationIPAddress;
-                const uint32_t ulSourceIPAddress = pxIPHeader->ulSourceIPAddress;
-
-                if( ( pxIPHeader->ucVersionHeaderLength < ipIPV4_VERSION_HEADER_LENGTH_MIN ) ||
-                    ( pxIPHeader->ucVersionHeaderLength > ipIPV4_VERSION_HEADER_LENGTH_MAX ) )
-                {
-                    return pdFALSE;
-                }
-
-                if( ( ( pxIPHeader->usFragmentOffset & ipFRAGMENT_OFFSET_BIT_MASK ) != 0U ) ||
-                    ( ( pxIPHeader->usFragmentOffset & ipFRAGMENT_FLAGS_MORE_FRAGMENTS ) != 0U ) )
-                {
-                    return pdFALSE;
-                }
-
-                if( xBadIPv4Loopback( pxIPHeader ) == pdTRUE )
-                {
-                    return pdFALSE;
-                }
-
-                if( memcmp( xBroadcastMACAddress.ucBytes,
-                            pxEthernetHeader->xSourceAddress.ucBytes,
-                            sizeof( MACAddress_t ) ) == 0 )
-                {
-                    return pdFALSE;
-                }
-
-                if( xIsIPv4Multicast( ulSourceIPAddress ) == pdTRUE )
-                {
-                    return pdFALSE;
-                }
-
-                if( FreeRTOS_IsEndPointUp( pxEndPoint ) != pdFALSE )
-                {
-                    if( ( ulDestinationIPAddress != pxEndPoint->ipv4_settings.ulIPAddress ) &&
-                        ( ulDestinationIPAddress != pxEndPoint->ipv4_settings.ulBroadcastAddress ) &&
-                        ( ulDestinationIPAddress != FREERTOS_INADDR_BROADCAST ) &&
-                        ( xIsIPv4Multicast( ulDestinationIPAddress ) == pdFALSE ) )
-                    {
-                        return pdFALSE;
-                    }
-
-                    if( ( ulSourceIPAddress == pxEndPoint->ipv4_settings.ulBroadcastAddress ) ||
-                        ( ulSourceIPAddress == FREERTOS_INADDR_BROADCAST ) )
-                    {
-                        return pdFALSE;
-                    }
-
-                    if( ( memcmp( xBroadcastMACAddress.ucBytes,
-                                  pxEthernetHeader->xDestinationAddress.ucBytes,
-                                  sizeof( MACAddress_t ) ) == 0 ) &&
-                        ( ulDestinationIPAddress != pxEndPoint->ipv4_settings.ulBroadcastAddress ) &&
-                        ( ulDestinationIPAddress != FREERTOS_INADDR_BROADCAST ) )
-                    {
-                        return pdFALSE;
-                    }
-                }
-                else if( memcmp( xBroadcastMACAddress.ucBytes,
-                                 pxEthernetHeader->xDestinationAddress.ucBytes,
-                                 sizeof( MACAddress_t ) ) == 0 )
-                {
-                    if( ulDestinationIPAddress != FREERTOS_INADDR_BROADCAST )
-                    {
-                        return pdFALSE;
-                    }
-                }
-                else if( memcmp( pxEndPoint->xMACAddress.ucBytes,
-                                 pxEthernetHeader->xDestinationAddress.ucBytes,
-                                 sizeof( MACAddress_t ) ) != 0 )
-                {
-                    return pdFALSE;
-                }
-
-                return pdTRUE;
-            }
-        #endif /* ipconfigUSE_IPv4 */
-
-        #if ipconfigIS_ENABLED( ipconfigUSE_IPv6 )
-            if( pxEthernetHeader->usFrameType == ipIPv6_FRAME_TYPE )
-            {
-                if( ENDPOINT_IS_IPv6( pxEndPoint ) == pdFALSE )
-                {
-                    return pdFALSE;
-                }
-
-                const IPPacket_IPv6_t * const pxIPv6Packet = ( const IPPacket_IPv6_t * const ) pxDescriptor->pucEthernetBuffer;
-                const IPHeader_IPv6_t * const pxIPv6Header = &( pxIPv6Packet->xIPHeader );
-                const IPv6_Address_t * const pxDestinationIPAddress = &( pxIPv6Header->xDestinationAddress );
-                const IPv6_Address_t * const pxSourceIPAddress = &( pxIPv6Header->xSourceAddress );
-
-                if( ( ( pxIPv6Header->ucVersionTrafficClass & ( uint8_t ) 0xF0U ) >> 4 ) != 6U )
-                {
-                    return pdFALSE;
-                }
-
-                if( ( memcmp( pxDestinationIPAddress->ucBytes, FreeRTOS_in6addr_any.ucBytes, sizeof( IPv6_Address_t ) ) == 0 ) ||
-                    ( memcmp( pxSourceIPAddress->ucBytes, FreeRTOS_in6addr_any.ucBytes, sizeof( IPv6_Address_t ) ) == 0 ) )
-                {
-                    return pdFALSE;
-                }
-
-                if( ( xIsIPv6Loopback( pxSourceIPAddress ) == pdTRUE ) ||
-                    ( xIsIPv6Loopback( pxDestinationIPAddress ) == pdTRUE ) )
-                {
-                    return pdFALSE;
-                }
-
-                if( ( memcmp( pxDestinationIPAddress->ucBytes,
-                              pxEndPoint->ipv6_settings.xIPAddress.ucBytes,
-                              sizeof( IPv6_Address_t ) ) != 0 ) &&
-                    ( xIsIPv6AllowedMulticast( pxDestinationIPAddress ) == pdFALSE ) &&
-                    ( FreeRTOS_IsNetworkUp() != 0 ) )
-                {
-                    return pdFALSE;
-                }
-
-                return pdTRUE;
-            }
-        #endif /* ipconfigUSE_IPv6 */
-
-        #if ipconfigIS_ENABLED( ipconfigPROCESS_CUSTOM_ETHERNET_FRAMES )
-            return pdTRUE;
-        #else
-            return pdFALSE;
-        #endif
-    }
-
-#endif /* ipconfigETHERNET_DRIVER_FILTERS_PACKETS */
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
