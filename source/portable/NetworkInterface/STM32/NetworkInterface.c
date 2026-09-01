@@ -58,7 +58,9 @@
 #include "phyHandling.h"
 
 /* ST includes. */
-#if defined( STM32F2 )
+#if defined( STM32F1 )
+    #include "stm32f1xx_hal.h"
+#elif defined( STM32F2 )
     #include "stm32f2xx_hal.h"
 #elif defined( STM32F4 )
     #include "stm32f4xx_hal.h"
@@ -82,7 +84,7 @@
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
-#if defined( STM32F7 ) || defined( STM32F4 ) || defined( STM32F2 )
+#if defined( STM32F7 ) || defined( STM32F4 ) || defined( STM32F2 ) || defined( STM32F1 )
     #define niEMAC_STM32FX
 #elif defined( STM32H7 ) || defined( STM32H7RS ) || defined( STM32H5 )
     #define niEMAC_STM32HX
