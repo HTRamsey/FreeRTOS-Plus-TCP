@@ -267,7 +267,7 @@
     #define niEMAC_DMA_ERROR_MASK                    HAL_ETH_ERROR_DMA
     #define niEMAC_MAC_ADDRESS_ENABLE_FLAG           ETH_MACA1HR_AE
 
-/* F4 and F7 do not provide the common control-packet filter aliases. */
+/* F1, F2, F4 and F7 do not provide the common filter aliases. */
     #undef ETH_CTRLPACKETS_BLOCK_ALL
     #define ETH_CTRLPACKETS_BLOCK_ALL    ETH_MACFFR_PCF_BlockAll
 
@@ -317,6 +317,15 @@
 #define niEMAC_MAC_IS_UNICAST( MAC )      ( ( MAC[ 0 ] & 1U ) == 0 )
 #define niEMAC_ADDRESS_HASH_BITS      64U
 #define niEMAC_MAC_SRC_MATCH_COUNT    3U
+
+#if defined( niEMAC_STM32FX )
+    /* F-series HAL expects [ high, low ]; newer HALs expect [ low, high ]. */
+    #define niEMAC_HASH_TABLE_LOW_WORD_INDEX     1U
+    #define niEMAC_HASH_TABLE_HIGH_WORD_INDEX    0U
+#else
+    #define niEMAC_HASH_TABLE_LOW_WORD_INDEX     0U
+    #define niEMAC_HASH_TABLE_HIGH_WORD_INDEX    1U
+#endif
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
@@ -422,8 +431,10 @@ static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
                                                NetworkInterface_t * pxInterface );
 static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                                     NetworkInterface_t * pxInterface );
-static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
-                                 NetworkInterface_t * pxInterface );
+static BaseType_t prvConfigureMACAddressFilter( ETH_HandleTypeDef * pxEthHandle );
+static BaseType_t prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
+                                      NetworkInterface_t * pxInterface );
+static BaseType_t prvRestoreMACAddressFilters( ETH_HandleTypeDef * pxEthHandle );
 #ifdef niEMAC_STM32HNX
     static void prvInitPacketFilter( ETH_HandleTypeDef * pxEthHandle,
                                      const NetworkInterface_t * const pxInterface );
@@ -504,6 +515,7 @@ static eMAC_INIT_STATUS_TYPE xMacInitStatus = eMacEthInit;
 
 /* Src Mac Matching */
 static uint8_t ucSrcMatchCounters[ niEMAC_MAC_SRC_MATCH_COUNT ] = { 0U };
+static uint8_t ucSrcMatchAddresses[ niEMAC_MAC_SRC_MATCH_COUNT ][ ipMAC_ADDRESS_LENGTH_BYTES ] = { 0U };
 /* Src Mac Hashing */
 static uint32_t ulHashTable[ niEMAC_ADDRESS_HASH_BITS / 32 ];
 static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
@@ -736,7 +748,9 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
     {
         ETH_HandleTypeDef * pxEthHandle = &xEthHandle;
 
-        if( ( pxDescriptor == NULL ) || ( pxDescriptor->pucEthernetBuffer == NULL ) || ( pxDescriptor->xDataLength > niEMAC_DATA_BUFFER_SIZE ) )
+        if( ( pxDescriptor == NULL ) || ( pxDescriptor->pucEthernetBuffer == NULL ) ||
+            ( pxDescriptor->xDataLength < sizeof( EthernetHeader_t ) ) ||
+            ( pxDescriptor->xDataLength > niEMAC_DATA_BUFFER_SIZE ) )
         {
             /* TODO: if xDataLength is greater than niEMAC_DATA_BUFFER_SIZE, you can link buffers */
             FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: Invalid Descriptor\n" ) );
@@ -777,11 +791,23 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
         if( pxEthHeader->usFrameType == ipIPv4_FRAME_TYPE )
         {
             #if ipconfigIS_ENABLED( ipconfigUSE_IPv4 )
+                if( pxDescriptor->xDataLength < sizeof( IPPacket_t ) )
+                {
+                    FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: Invalid IPv4 packet\n" ) );
+                    break;
+                }
+
                 const IPPacket_t * const pxIPPacket = ( const IPPacket_t * const ) pxDescriptor->pucEthernetBuffer;
 
                 if( pxIPPacket->xIPHeader.ucProtocol == ipPROTOCOL_ICMP )
                 {
                     #if ipconfigIS_ENABLED( ipconfigREPLY_TO_INCOMING_PINGS ) || ipconfigIS_ENABLED( ipconfigSUPPORT_OUTGOING_PINGS )
+                        if( pxDescriptor->xDataLength < sizeof( ICMPPacket_t ) )
+                        {
+                            FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: Invalid ICMP packet\n" ) );
+                            break;
+                        }
+
                         ICMPPacket_t * const pxICMPPacket = ( ICMPPacket_t * const ) pxDescriptor->pucEthernetBuffer;
                         #if ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM )
                             pxICMPPacket->xICMPHeader.usChecksum = 0U;
@@ -865,6 +891,27 @@ static void prvAddAllowedMACAddress( NetworkInterface_t * pxInterface,
                                      const uint8_t * pucMacAddress )
 {
     ETH_HandleTypeDef * pxEthHandle = &xEthHandle;
+    ( void ) pxInterface;
+
+    if( pucMacAddress == NULL )
+    {
+        return;
+    }
+
+    BaseType_t xMutexTaken = pdFALSE;
+
+    /* The mutex is created after initial MAC setup. Once it exists, use it to
+     * serialize runtime filter changes with fatal-error recovery. */
+    if( xTxMutex != NULL )
+    {
+        xMutexTaken = xSemaphoreTake( xTxMutex, portMAX_DELAY );
+
+        if( xMutexTaken == pdFALSE )
+        {
+            FreeRTOS_debug_printf( ( "prvAddAllowedMACAddress: Failed to take mutex\n" ) );
+            return;
+        }
+    }
 
     /* TODO: group address filtering with Mask Byte Control */
     BaseType_t xResult = prvAddDestMACAddrMatch( pxEthHandle->Instance, pucMacAddress );
@@ -880,6 +927,11 @@ static void prvAddAllowedMACAddress( NetworkInterface_t * pxInterface,
             prvAddDestMACAddrHash( pxEthHandle, ucHashIndex );
         }
     }
+
+    if( xMutexTaken != pdFALSE )
+    {
+        ( void ) xSemaphoreGive( xTxMutex );
+    }
 }
 
 /*---------------------------------------------------------------------------*/
@@ -888,12 +940,36 @@ static void prvRemoveAllowedMACAddress( NetworkInterface_t * pxInterface,
                                         const uint8_t * pucMacAddress )
 {
     ETH_HandleTypeDef * pxEthHandle = &xEthHandle;
+    ( void ) pxInterface;
+
+    if( pucMacAddress == NULL )
+    {
+        return;
+    }
+
+    BaseType_t xMutexTaken = pdFALSE;
+
+    if( xTxMutex != NULL )
+    {
+        xMutexTaken = xSemaphoreTake( xTxMutex, portMAX_DELAY );
+
+        if( xMutexTaken == pdFALSE )
+        {
+            FreeRTOS_debug_printf( ( "prvRemoveAllowedMACAddress: Failed to take mutex\n" ) );
+            return;
+        }
+    }
 
     const BaseType_t xResult = prvRemoveDestMACAddrMatch( pxEthHandle->Instance, pucMacAddress );
 
     if( xResult == pdFALSE )
     {
         prvRemoveDestMACAddrHash( pxEthHandle, pucMacAddress );
+    }
+
+    if( xMutexTaken != pdFALSE )
+    {
+        ( void ) xSemaphoreGive( xTxMutex );
     }
 }
 
@@ -999,6 +1075,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
     NetworkInterface_t * pxInterface = ( NetworkInterface_t * ) pvParameters;
     ETH_HandleTypeDef * pxEthHandle = &xEthHandle;
     EthernetPhy_t * pxPhyObject = &xPhyObject;
+    BaseType_t xRecoveryRequired = pdFALSE;
 
     /* iptraceEMAC_TASK_STARTING(); */
 
@@ -1063,49 +1140,76 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
                 if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
                 {
-                    if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject, pxInterface ) != pdFALSE )
-                    {
-                        if( HAL_ETH_Start_IT( pxEthHandle ) == HAL_OK )
-                        {
-                            xResult = prvNetworkInterfaceInput( pxEthHandle, pxInterface );
-                        }
-                        else
-                        {
-                            FreeRTOS_debug_printf( ( "prvEMACHandlerTask: HAL_ETH_Start_IT failed after recovery\n" ) );
-                        }
-                    }
+                    xRecoveryRequired = pdTRUE;
                 }
             }
         }
 
-        if( xPhyCheckLinkStatus( pxPhyObject, xResult ) != pdFALSE )
+        if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
         {
-            if( prvGetPhyLinkStatus( pxInterface ) != pdFALSE )
-            {
-                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_ERROR )
-                {
-                    if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject, pxInterface ) == pdFALSE )
-                    {
-                        FreeRTOS_debug_printf( ( "prvEMACHandlerTask: recovery failed while link-up\n" ) );
-                    }
-                }
+            xRecoveryRequired = pdTRUE;
+        }
 
-                if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_READY )
+        if( xRecoveryRequired != pdFALSE )
+        {
+            if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject, pxInterface ) != pdFALSE )
+            {
+                if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
                 {
-                    /* Link was down or critical error occurred */
-                    if( prvMacUpdateConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
+                    xRecoveryRequired = pdFALSE;
+                }
+                else if( HAL_ETH_Start_IT( pxEthHandle ) == HAL_OK )
+                {
+                    xRecoveryRequired = pdFALSE;
+                    xResult = prvNetworkInterfaceInput( pxEthHandle, pxInterface );
+                }
+                else
+                {
+                    FreeRTOS_debug_printf( ( "prvEMACHandlerTask: HAL_ETH_Start_IT failed after recovery\n" ) );
+                }
+            }
+        }
+
+        const BaseType_t xLinkStatusChanged = xPhyCheckLinkStatus( pxPhyObject, xResult );
+
+        if( prvGetPhyLinkStatus( pxInterface ) != pdFALSE )
+        {
+            if( ( xRecoveryRequired == pdFALSE ) &&
+                ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_READY ) )
+            {
+                /* Link was down, or a previous start attempt failed. */
+                if( prvMacUpdateConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
+                {
+                    if( HAL_ETH_Start_IT( pxEthHandle ) != HAL_OK )
                     {
-                        if( HAL_ETH_Start_IT( pxEthHandle ) != HAL_OK )
-                        {
-                            FreeRTOS_debug_printf( ( "prvEMACHandlerTask: HAL_ETH_Start_IT failed on link-up\n" ) );
-                        }
+                        FreeRTOS_debug_printf( ( "prvEMACHandlerTask: HAL_ETH_Start_IT failed on link-up\n" ) );
                     }
                 }
             }
-            else
+        }
+        else
+        {
+            BaseType_t xMACStopped = pdFALSE;
+
+            if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
             {
-                ( void ) HAL_ETH_Stop_IT( pxEthHandle );
+                if( HAL_ETH_Stop_IT( pxEthHandle ) != HAL_OK )
+                {
+                    FreeRTOS_debug_printf( ( "prvEMACHandlerTask: HAL_ETH_Stop_IT failed on link-down\n" ) );
+                }
+                else
+                {
+                    xMACStopped = pdTRUE;
+                }
+            }
+
+            if( ( xMACStopped != pdFALSE ) || ( xLinkStatusChanged != pdFALSE ) )
+            {
                 prvReleaseTxPacket( pxEthHandle );
+            }
+
+            if( xLinkStatusChanged != pdFALSE )
+            {
                 #if ( ipconfigIS_ENABLED( ipconfigSUPPORT_NETWORK_DOWN_EVENT ) )
                     FreeRTOS_NetworkDown( pxInterface );
                 #endif
@@ -1258,6 +1362,9 @@ static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
                                                NetworkInterface_t * pxInterface )
 {
     BaseType_t xResult = pdFALSE;
+    NetworkBufferDescriptor_t * pxTxPackets[ ETH_TX_DESC_CNT ] = { NULL };
+    NetworkBufferDescriptor_t * pxPartialRxPackets[ niEMAC_RX_CHANNEL_COUNT ] = { NULL };
+    uint8_t * pucRxBuffers[ niEMAC_RX_CHANNEL_COUNT ][ ETH_RX_DESC_CNT ] = { { NULL } };
 
     if( ( xTxMutex == NULL ) || ( xTxDescSem == NULL ) ||
         ( xSemaphoreTake( xTxMutex, pdMS_TO_TICKS( niEMAC_TX_MAX_BLOCK_TIME_MS ) ) == pdFALSE ) )
@@ -1269,33 +1376,31 @@ static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
     xDropCurrentRxFrame = pdFALSE;
 
     ETH_TxDescListTypeDef * const pxTxDescList = &( niEMAC_TX_DESC_LIST( pxEthHandle, niEMAC_DMA_CHANNEL_INDEX ) );
-    UBaseType_t uxBuffersReleased = 0U;
+
+    #if defined( niEMAC_STM32NX )
+        pxEthHandle->TxOpCH = niEMAC_DMA_CHANNEL_INDEX;
+    #endif
+    const uint32_t ulTxBuffersInUse = HAL_ETH_GetTxBuffersNumber( pxEthHandle );
 
     for( UBaseType_t uxIndex = 0U; uxIndex < ( UBaseType_t ) ETH_TX_DESC_CNT; uxIndex++ )
     {
-        NetworkBufferDescriptor_t * const pxDescriptor = ( NetworkBufferDescriptor_t * ) pxTxDescList->PacketAddress[ uxIndex ];
-
-        if( pxDescriptor != NULL )
-        {
-            pxTxDescList->PacketAddress[ uxIndex ] = NULL;
-            prvReleaseNetworkBufferDescriptor( pxDescriptor );
-            uxBuffersReleased++;
-        }
+        pxTxPackets[ uxIndex ] = ( NetworkBufferDescriptor_t * ) pxTxDescList->PacketAddress[ uxIndex ];
     }
 
-    pxTxDescList->BuffersInUse = 0U;
-    pxTxDescList->releaseIndex = 0U;
-    pxTxDescList->CurrentPacketAddress = NULL;
-
-    for( UBaseType_t uxIndex = 0U; uxIndex < uxBuffersReleased; uxIndex++ )
+    for( uint32_t ulChannel = 0U; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
     {
-        const BaseType_t xGiveResult = xSemaphoreGive( xTxDescSem );
+        ETH_RxDescListTypeDef * const pxRxDescList = &( niEMAC_RX_DESC_LIST( pxEthHandle, ulChannel ) );
 
-        configASSERT( xGiveResult == pdTRUE );
+        pxPartialRxPackets[ ulChannel ] = ( NetworkBufferDescriptor_t * ) pxRxDescList->pRxStart;
 
-        if( xGiveResult == pdFALSE )
+        for( UBaseType_t uxIndex = 0U; uxIndex < ( UBaseType_t ) ETH_RX_DESC_CNT; uxIndex++ )
         {
-            break;
+            ETH_DMADescTypeDef * const pxRxDesc = ( ETH_DMADescTypeDef * ) ( uintptr_t ) pxRxDescList->RxDesc[ uxIndex ];
+
+            if( pxRxDesc != NULL )
+            {
+                pucRxBuffers[ ulChannel ][ uxIndex ] = ( uint8_t * ) ( uintptr_t ) pxRxDesc->BackupAddr0;
+            }
         }
     }
 
@@ -1303,18 +1408,89 @@ static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
     {
         FreeRTOS_debug_printf( ( "prvRecoverFromCriticalError: HAL_ETH_Init failed\n" ) );
     }
-    else if( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) == pdFALSE )
-    {
-        FreeRTOS_debug_printf( ( "prvRecoverFromCriticalError: Failed to restore MAC/DMA configuration\n" ) );
-    }
     else
     {
-        #if defined( niEMAC_STM32HNX )
-            prvInitPacketFilter( pxEthHandle, pxInterface );
+        UBaseType_t uxPacketsReleased = 0U;
+
+        #if defined( niEMAC_STM32FX )
+            /* F-series HAL_ETH_Init() does not restore the MDIO clock divider. */
+            HAL_ETH_SetMDIOClockRange( pxEthHandle );
         #endif
 
-        prvInitMacAddresses( pxEthHandle, pxInterface );
-        xResult = pdTRUE;
+        /* HAL reinitialisation has stopped DMA and reset the descriptors, so
+         * their zero-copy buffers can now be safely returned. */
+        for( UBaseType_t uxIndex = 0U; uxIndex < ( UBaseType_t ) ETH_TX_DESC_CNT; uxIndex++ )
+        {
+            pxTxDescList->PacketAddress[ uxIndex ] = NULL;
+
+            if( pxTxPackets[ uxIndex ] != NULL )
+            {
+                prvReleaseNetworkBufferDescriptor( pxTxPackets[ uxIndex ] );
+                uxPacketsReleased++;
+            }
+        }
+
+        if( uxPacketsReleased != ( UBaseType_t ) ulTxBuffersInUse )
+        {
+            FreeRTOS_debug_printf( ( "prvRecoverFromCriticalError: TX buffer bookkeeping mismatch\n" ) );
+            configASSERT( uxPacketsReleased == ( UBaseType_t ) ulTxBuffersInUse );
+        }
+
+        pxTxDescList->BuffersInUse = 0U;
+        pxTxDescList->releaseIndex = 0U;
+        pxTxDescList->CurrentPacketAddress = NULL;
+
+        for( uint32_t ulIndex = 0U; ulIndex < ulTxBuffersInUse; ulIndex++ )
+        {
+            const BaseType_t xGiveResult = xSemaphoreGive( xTxDescSem );
+
+            configASSERT( xGiveResult == pdTRUE );
+
+            if( xGiveResult == pdFALSE )
+            {
+                break;
+            }
+        }
+
+        for( uint32_t ulChannel = 0U; ulChannel < niEMAC_RX_CHANNEL_COUNT; ulChannel++ )
+        {
+            ETH_RxDescListTypeDef * const pxRxDescList = &( niEMAC_RX_DESC_LIST( pxEthHandle, ulChannel ) );
+
+            pxRxDescList->pRxStart = NULL;
+            pxRxDescList->pRxEnd = NULL;
+            pxRxDescList->RxDataLength = 0U;
+            pxRxDescList->pRxLastRxDesc = 0U;
+
+            prvReleaseNetworkBufferDescriptor( pxPartialRxPackets[ ulChannel ] );
+
+            for( UBaseType_t uxIndex = 0U; uxIndex < ( UBaseType_t ) ETH_RX_DESC_CNT; uxIndex++ )
+            {
+                if( pucRxBuffers[ ulChannel ][ uxIndex ] != NULL )
+                {
+                    NetworkBufferDescriptor_t * const pxDescriptor = pxPacketBuffer_to_NetworkBuffer( ( const void * ) pucRxBuffers[ ulChannel ][ uxIndex ] );
+
+                    configASSERT( pxDescriptor != NULL );
+
+                    if( pxDescriptor != NULL )
+                    {
+                        prvReleaseNetworkBufferDescriptor( pxDescriptor );
+                    }
+                }
+            }
+        }
+
+        if( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) == pdFALSE )
+        {
+            FreeRTOS_debug_printf( ( "prvRecoverFromCriticalError: Failed to restore MAC/DMA configuration\n" ) );
+        }
+        else
+        {
+            #if defined( niEMAC_STM32HNX )
+                prvInitPacketFilter( pxEthHandle, pxInterface );
+            #endif
+
+            xResult = prvRestoreMACAddressFilters( pxEthHandle );
+        }
     }
 
     ( void ) xSemaphoreGive( xTxMutex );
@@ -1383,8 +1559,10 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                     prvInitPacketFilter( pxEthHandle, pxInterface );
                 #endif
 
-                prvInitMacAddresses( pxEthHandle, pxInterface );
-                xResult = pdTRUE;
+                if( prvInitMacAddresses( pxEthHandle, pxInterface ) != pdFALSE )
+                {
+                    xResult = pdTRUE;
+                }
             }
         }
     }
@@ -1430,16 +1608,14 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
 
 /*---------------------------------------------------------------------------*/
 
-static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
-                                 NetworkInterface_t * pxInterface )
+static BaseType_t prvConfigureMACAddressFilter( ETH_HandleTypeDef * pxEthHandle )
 {
     ETH_MACFilterConfigTypeDef xFilterConfig = { 0 };
 
-    prvResetMACAddressFilters( pxEthHandle );
-
     if( HAL_ETH_GetMACFilterConfig( pxEthHandle, &xFilterConfig ) != HAL_OK )
     {
-        FreeRTOS_debug_printf( ( "prvInitMacAddresses: HAL_ETH_GetMACFilterConfig failed\n" ) );
+        FreeRTOS_debug_printf( ( "prvConfigureMACAddressFilter: HAL_ETH_GetMACFilterConfig failed\n" ) );
+        return pdFALSE;
     }
 
     xFilterConfig.ReceiveAllMode = DISABLE;
@@ -1456,8 +1632,24 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
 
     if( HAL_ETH_SetMACFilterConfig( pxEthHandle, &xFilterConfig ) != HAL_OK )
     {
-        FreeRTOS_debug_printf( ( "prvInitMacAddresses: HAL_ETH_SetMACFilterConfig failed\n" ) );
+        FreeRTOS_debug_printf( ( "prvConfigureMACAddressFilter: HAL_ETH_SetMACFilterConfig failed\n" ) );
+        return pdFALSE;
     }
+
+    return pdTRUE;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
+                                      NetworkInterface_t * pxInterface )
+{
+    if( prvConfigureMACAddressFilter( pxEthHandle ) == pdFALSE )
+    {
+        return pdFALSE;
+    }
+
+    prvResetMACAddressFilters( pxEthHandle );
 
     NetworkEndPoint_t * pxEndPoint;
 
@@ -1484,6 +1676,38 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
             prvAddAllowedMACAddress( pxInterface, xLLMNR_MacAddressIPv6.ucBytes );
         #endif
     #endif
+
+    return pdTRUE;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvRestoreMACAddressFilters( ETH_HandleTypeDef * pxEthHandle )
+{
+    if( prvConfigureMACAddressFilter( pxEthHandle ) == pdFALSE )
+    {
+        return pdFALSE;
+    }
+
+    for( uint8_t ucIndex = 0U; ucIndex < niEMAC_MAC_SRC_MATCH_COUNT; ucIndex++ )
+    {
+        if( ucSrcMatchCounters[ ucIndex ] > 0U )
+        {
+            prvHAL_ETH_SetDestMACAddrMatch( pxEthHandle->Instance, ucIndex, ucSrcMatchAddresses[ ucIndex ] );
+        }
+        else
+        {
+            prvHAL_ETH_ClearDestMACAddrMatch( pxEthHandle->Instance, ucIndex );
+        }
+    }
+
+    if( HAL_ETH_SetHashTable( pxEthHandle, ulHashTable ) != HAL_OK )
+    {
+        FreeRTOS_debug_printf( ( "prvRestoreMACAddressFilters: HAL_ETH_SetHashTable failed\n" ) );
+        return pdFALSE;
+    }
+
+    return pdTRUE;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1493,6 +1717,7 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
     static void prvInitPacketFilter( ETH_HandleTypeDef * pxEthHandle,
                                      const NetworkInterface_t * const pxInterface )
     {
+        ( void ) pxInterface;
         HAL_ETHEx_DisableL3L4Filtering( pxEthHandle );
 
         #if ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM )
@@ -1501,25 +1726,41 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
 
             if( ucFilterCount > 0 )
             {
-                ETH_MACConfigTypeDef xMACConfig;
-                ( void ) HAL_ETH_GetMACConfig( pxEthHandle, &xMACConfig );
+                ETH_MACConfigTypeDef xMACConfig = { 0 };
+
+                if( HAL_ETH_GetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
+                {
+                    FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETH_GetMACConfig failed\n" ) );
+                    return;
+                }
 
                 if( xMACConfig.ChecksumOffload != ENABLE )
                 {
                     /* "The Layer 3 and Layer 4 Packet Filter feature automatically selects the IPC Full Checksum
                      * Offload Engine on the Receive side. When this feature is enabled, you must set the IPC bit." */
                     xMACConfig.ChecksumOffload = ENABLE;
-                    ( void ) HAL_ETH_SetMACConfig( pxEthHandle, &xMACConfig );
+
+                    if( HAL_ETH_SetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
+                    {
+                        FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETH_SetMACConfig failed\n" ) );
+                        return;
+                    }
                 }
 
                 #if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_FRAME_TYPES )
                 {
-                    ETH_L3FilterConfigTypeDef xL3FilterConfig;
+                    #if ipconfigIS_DISABLED( ipconfigUSE_IPv4 ) || ipconfigIS_DISABLED( ipconfigUSE_IPv6 )
+                        ETH_L3FilterConfigTypeDef xL3FilterConfig = { 0 };
+                    #endif
 
                     /* Filter out all possibilities if frame type is disabled */
                     #if ipconfigIS_DISABLED( ipconfigUSE_IPv4 )
                         /* Block IPv4 if it is disabled */
-                        ( void ) HAL_ETHEx_GetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_0, &xL3FilterConfig );
+                        if( HAL_ETHEx_GetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_0, &xL3FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_GetL3FilterConfig failed\n" ) );
+                            return;
+                        }
                         xL3FilterConfig.Protocol = ETH_L3_IPV4_MATCH;
                         xL3FilterConfig.SrcAddrFilterMatch = ETH_L3_SRC_ADDR_PERFECT_MATCH_ENABLE;
                         xL3FilterConfig.DestAddrFilterMatch = ETH_L3_DEST_ADDR_PERFECT_MATCH_ENABLE;
@@ -1527,12 +1768,20 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
                         xL3FilterConfig.DestAddrHigherBitsMatch = 0x1FU;
                         xL3FilterConfig.Ip4SrcAddr = FREERTOS_INADDR_BROADCAST;
                         xL3FilterConfig.Ip4DestAddr = FREERTOS_INADDR_BROADCAST;
-                        ( void ) HAL_ETHEx_SetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_0, &xL3FilterConfig );
+                        if( HAL_ETHEx_SetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_0, &xL3FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_SetL3FilterConfig failed\n" ) );
+                            return;
+                        }
                     #endif /* if ipconfigIS_DISABLED( ipconfigUSE_IPv4 ) */
 
                     #if ipconfigIS_DISABLED( ipconfigUSE_IPv6 )
                         /* Block IPv6 if it is disabled */
-                        ( void ) HAL_ETHEx_GetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_1, &xL3FilterConfig );
+                        if( HAL_ETHEx_GetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_1, &xL3FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_GetL3FilterConfig failed\n" ) );
+                            return;
+                        }
                         xL3FilterConfig.Protocol = ETH_L3_IPV6_MATCH;
                         xL3FilterConfig.SrcAddrFilterMatch = ETH_L3_SRC_ADDR_PERFECT_MATCH_ENABLE;
                         xL3FilterConfig.DestAddrFilterMatch = ETH_L3_DEST_ADDR_PERFECT_MATCH_ENABLE;
@@ -1542,7 +1791,11 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
                         xL3FilterConfig.Ip6Addr[ 1 ] = 0xFFFFFFFFU;
                         xL3FilterConfig.Ip6Addr[ 2 ] = 0xFFFFFFFFU;
                         xL3FilterConfig.Ip6Addr[ 3 ] = 0xFFFFFFFFU;
-                        ( void ) HAL_ETHEx_SetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_1, &xL3FilterConfig );
+                        if( HAL_ETHEx_SetL3FilterConfig( pxEthHandle, ETH_L3_FILTER_1, &xL3FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_SetL3FilterConfig failed\n" ) );
+                            return;
+                        }
                     #endif /* if ipconfigIS_DISABLED( ipconfigUSE_IPv6 ) */
 
                     /* TODO: Handle multiple endpoints */
@@ -1588,26 +1841,42 @@ static void prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
                 {
                     /* TODO: Let user to block certain port numbers */
                     /* TODO: Live updated in task based on active sockets? */
-                    ETH_L4FilterConfigTypeDef xL4FilterConfig;
+                    ETH_L4FilterConfigTypeDef xL4FilterConfig = { 0 };
 
                     /* Always allow all UDP */
-                    ( void ) HAL_ETHEx_GetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_0, &xL4FilterConfig );
+                    if( HAL_ETHEx_GetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_0, &xL4FilterConfig ) != HAL_OK )
+                    {
+                        FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_GetL4FilterConfig failed\n" ) );
+                        return;
+                    }
                     xL4FilterConfig.Protocol = ETH_L4_UDP_MATCH;
                     xL4FilterConfig.SrcPortFilterMatch = ETH_L4_SRC_PORT_MATCH_DISABLE;
                     xL4FilterConfig.DestPortFilterMatch = ETH_L4_DEST_PORT_MATCH_DISABLE;
                     xL4FilterConfig.SourcePort = 0U;
                     xL4FilterConfig.DestinationPort = 0U;
-                    ( void ) HAL_ETHEx_SetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_0, &xL4FilterConfig );
+                    if( HAL_ETHEx_SetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_0, &xL4FilterConfig ) != HAL_OK )
+                    {
+                        FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_SetL4FilterConfig failed\n" ) );
+                        return;
+                    }
 
                     #if ipconfigIS_DISABLED( ipconfigUSE_TCP )
                         /* Block TCP if it is disabled */
-                        ( void ) HAL_ETHEx_GetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_1, &xL4FilterConfig );
+                        if( HAL_ETHEx_GetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_1, &xL4FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_GetL4FilterConfig failed\n" ) );
+                            return;
+                        }
                         xL4FilterConfig.Protocol = ETH_L4_TCP_MATCH;
                         xL4FilterConfig.SrcPortFilterMatch = ETH_L4_SRC_PORT_PERFECT_MATCH_ENABLE;
                         xL4FilterConfig.DestPortFilterMatch = ETH_L4_DEST_PORT_PERFECT_MATCH_ENABLE;
                         xL4FilterConfig.SourcePort = 0xFFFFU;
                         xL4FilterConfig.DestinationPort = 0xFFFFU;
-                        ( void ) HAL_ETHEx_SetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_1, &xL4FilterConfig );
+                        if( HAL_ETHEx_SetL4FilterConfig( pxEthHandle, ETH_L4_FILTER_1, &xL4FilterConfig ) != HAL_OK )
+                        {
+                            FreeRTOS_debug_printf( ( "prvInitPacketFilter: HAL_ETHEx_SetL4FilterConfig failed\n" ) );
+                            return;
+                        }
                     #endif
                 }
                 #endif /* if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS ) */
@@ -1745,6 +2014,7 @@ static void prvHAL_ETH_SetDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
     /* MACA0HR/MACA0LR reserved for the primary MAC-address. */
     const uintptr_t uxMacRegHigh = ( uintptr_t ) &( pxEthInstance->MACA1HR ) + ( 8U * ucIndex );
     const uintptr_t uxMacRegLow = ( uintptr_t ) &( pxEthInstance->MACA1LR ) + ( 8U * ucIndex );
+    ( void ) memcpy( ucSrcMatchAddresses[ ucIndex ], pucMACAddr, ipMAC_ADDRESS_LENGTH_BYTES );
     ( *( __IO uint32_t * ) uxMacRegHigh ) = niEMAC_MAC_ADDRESS_ENABLE_FLAG | ulMacAddrHigh;
     ( *( __IO uint32_t * ) uxMacRegLow ) = ulMacAddrLow;
 }
@@ -1759,6 +2029,7 @@ static void prvHAL_ETH_ClearDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
     const uintptr_t uxMacRegLow = ( uintptr_t ) &( pxEthInstance->MACA1LR ) + ( 8U * ucIndex );
     ( *( __IO uint32_t * ) uxMacRegHigh ) = 0U;
     ( *( __IO uint32_t * ) uxMacRegLow ) = 0U;
+    ( void ) memset( ucSrcMatchAddresses[ ucIndex ], 0, ipMAC_ADDRESS_LENGTH_BYTES );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1767,6 +2038,7 @@ static BaseType_t prvAddDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
                                           const uint8_t * const pucMACAddr )
 {
     BaseType_t xResult = pdFALSE;
+    ( void ) pxEthInstance;
 
     uint8_t ucIndex;
 
@@ -1774,16 +2046,7 @@ static BaseType_t prvAddDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
     {
         if( ucSrcMatchCounters[ ucIndex ] > 0U )
         {
-            /* ETH_MACA1HR_MBC - Group Address Filtering */
-            const uintptr_t uxMacRegHigh = ( uintptr_t ) &( pxEthInstance->MACA1HR ) + ( 8U * ucIndex );
-            const uintptr_t uxMacRegLow = ( uintptr_t ) &( pxEthInstance->MACA1LR ) + ( 8U * ucIndex );
-
-            const uint32_t ulMacAddrHigh = ( ( uint32_t ) pucMACAddr[ 5 ] << 8 ) | ( uint32_t ) pucMACAddr[ 4 ];
-            const uint32_t ulMacAddrLow = ( ( uint32_t ) pucMACAddr[ 3 ] << 24 ) | ( ( uint32_t ) pucMACAddr[ 2 ] << 16 ) | ( ( uint32_t ) pucMACAddr[ 1 ] << 8 ) | ( uint32_t ) pucMACAddr[ 0 ];
-            const uint32_t ulMacRegHigh = *( __IO uint32_t * ) uxMacRegHigh;
-            const uint32_t ulMacRegLow = *( __IO uint32_t * ) uxMacRegLow;
-
-            if( ( ( ulMacRegHigh & 0xFFFFU ) == ulMacAddrHigh ) && ( ulMacRegLow == ulMacAddrLow ) )
+            if( memcmp( ucSrcMatchAddresses[ ucIndex ], pucMACAddr, ipMAC_ADDRESS_LENGTH_BYTES ) == 0 )
             {
                 if( ucSrcMatchCounters[ ucIndex ] < UINT8_MAX )
                 {
@@ -1812,18 +2075,13 @@ static BaseType_t prvRemoveDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
     {
         if( ucSrcMatchCounters[ ucIndex ] > 0U )
         {
-            /* ETH_MACA1HR_MBC - Group Address Filtering */
-            const uintptr_t uxMacRegHigh = ( uintptr_t ) &( pxEthInstance->MACA1HR ) + ( 8U * ucIndex );
-            const uintptr_t uxMacRegLow = ( uintptr_t ) &( pxEthInstance->MACA1LR ) + ( 8U * ucIndex );
-
-            const uint32_t ulMacAddrHigh = ( ( uint32_t ) pucMACAddr[ 5 ] << 8 ) | ( uint32_t ) pucMACAddr[ 4 ];
-            const uint32_t ulMacAddrLow = ( ( uint32_t ) pucMACAddr[ 3 ] << 24 ) | ( ( uint32_t ) pucMACAddr[ 2 ] << 16 ) | ( ( uint32_t ) pucMACAddr[ 1 ] << 8 ) | ( uint32_t ) pucMACAddr[ 0 ];
-            const uint32_t ulMacRegHigh = *( __IO uint32_t * ) uxMacRegHigh;
-            const uint32_t ulMacRegLow = *( __IO uint32_t * ) uxMacRegLow;
-
-            if( ( ( ulMacRegHigh & 0xFFFFU ) == ulMacAddrHigh ) && ( ulMacRegLow == ulMacAddrLow ) )
+            if( memcmp( ucSrcMatchAddresses[ ucIndex ], pucMACAddr, ipMAC_ADDRESS_LENGTH_BYTES ) == 0 )
             {
-                if( --( ucSrcMatchCounters[ ucIndex ] ) == 0U )
+                /* A saturated reference count cannot be decremented safely: its
+                 * true value is unknown. Keep accepting the address instead of
+                 * clearing an entry that may still have users. */
+                if( ( ucSrcMatchCounters[ ucIndex ] < UINT8_MAX ) &&
+                    ( --( ucSrcMatchCounters[ ucIndex ] ) == 0U ) )
                 {
                     prvHAL_ETH_ClearDestMACAddrMatch( pxEthInstance, ucIndex );
                 }
@@ -1871,13 +2129,13 @@ static void prvAddDestMACAddrHash( ETH_HandleTypeDef * pxEthHandle,
 {
     if( ucAddrHashCounters[ ucHashIndex ] == 0 )
     {
-        if( ucHashIndex & 0x20U )
+        if( ( ucHashIndex & 0x20U ) != 0U )
         {
-            ulHashTable[ 1 ] |= ( 1U << ( ucHashIndex & 0x1FU ) );
+            ulHashTable[ niEMAC_HASH_TABLE_HIGH_WORD_INDEX ] |= ( 1U << ( ucHashIndex & 0x1FU ) );
         }
         else
         {
-            ulHashTable[ 0 ] |= ( 1U << ucHashIndex );
+            ulHashTable[ niEMAC_HASH_TABLE_LOW_WORD_INDEX ] |= ( 1U << ucHashIndex );
         }
 
         HAL_ETH_SetHashTable( pxEthHandle, ulHashTable );
@@ -1898,15 +2156,16 @@ static void prvRemoveDestMACAddrHash( ETH_HandleTypeDef * pxEthHandle,
 
     if( ucAddrHashCounters[ ucHashIndex ] > 0U )
     {
-        if( --( ucAddrHashCounters[ ucHashIndex ] ) == 0U )
+        if( ( ucAddrHashCounters[ ucHashIndex ] < UINT8_MAX ) &&
+            ( --( ucAddrHashCounters[ ucHashIndex ] ) == 0U ) )
         {
             if( ( ucHashIndex & 0x20U ) != 0U )
             {
-                ulHashTable[ 1 ] &= ~( 1U << ( ucHashIndex & 0x1FU ) );
+                ulHashTable[ niEMAC_HASH_TABLE_HIGH_WORD_INDEX ] &= ~( 1U << ( ucHashIndex & 0x1FU ) );
             }
             else
             {
-                ulHashTable[ 0 ] &= ~( 1U << ucHashIndex );
+                ulHashTable[ niEMAC_HASH_TABLE_LOW_WORD_INDEX ] &= ~( 1U << ucHashIndex );
             }
 
             ( void ) HAL_ETH_SetHashTable( pxEthHandle, ulHashTable );
@@ -1919,6 +2178,7 @@ static void prvRemoveDestMACAddrHash( ETH_HandleTypeDef * pxEthHandle,
 static void prvResetMACAddressFilters( ETH_HandleTypeDef * pxEthHandle )
 {
     ( void ) memset( ucSrcMatchCounters, 0, sizeof( ucSrcMatchCounters ) );
+    ( void ) memset( ucSrcMatchAddresses, 0, sizeof( ucSrcMatchAddresses ) );
     ( void ) memset( ulHashTable, 0, sizeof( ulHashTable ) );
     ( void ) memset( ucAddrHashCounters, 0, sizeof( ucAddrHashCounters ) );
 
@@ -1996,7 +2256,11 @@ static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
 
     if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
     {
-        ( void ) HAL_ETH_Stop_IT( pxEthHandle );
+        if( HAL_ETH_Stop_IT( pxEthHandle ) != HAL_OK )
+        {
+            FreeRTOS_debug_printf( ( "prvMacUpdateConfig: HAL_ETH_Stop_IT failed\n" ) );
+            return pdFALSE;
+        }
     }
 
     #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
@@ -2471,6 +2735,7 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
     if( ( ppvStart == NULL ) || ( ppvEnd == NULL ) )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Invalid callback context\n" ) );
+        xDropCurrentRxFrame = pdTRUE;
 
         if( pucBuff != NULL )
         {
@@ -2485,19 +2750,42 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
         return;
     }
 
+    NetworkBufferDescriptor_t ** const ppxStartDescriptor = ( NetworkBufferDescriptor_t ** ) ppvStart;
+    NetworkBufferDescriptor_t ** const ppxEndDescriptor = ( NetworkBufferDescriptor_t ** ) ppvEnd;
+
     if( pucBuff == NULL )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: NULL buffer pointer\n" ) );
+
+        if( *ppxStartDescriptor != NULL )
+        {
+            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
+
+            *ppxStartDescriptor = NULL;
+            *ppxEndDescriptor = NULL;
+            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
+        }
+
+        xDropCurrentRxFrame = pdTRUE;
         return;
     }
 
-    NetworkBufferDescriptor_t ** const ppxStartDescriptor = ( NetworkBufferDescriptor_t ** ) ppvStart;
-    NetworkBufferDescriptor_t ** const ppxEndDescriptor = ( NetworkBufferDescriptor_t ** ) ppvEnd;
     NetworkBufferDescriptor_t * const pxCurDescriptor = pxPacketBuffer_to_NetworkBuffer( ( const void * ) pucBuff );
 
     if( pxCurDescriptor == NULL )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Invalid buffer descriptor\n" ) );
+
+        if( *ppxStartDescriptor != NULL )
+        {
+            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
+
+            *ppxStartDescriptor = NULL;
+            *ppxEndDescriptor = NULL;
+            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
+        }
+
+        xDropCurrentRxFrame = pdTRUE;
         return;
     }
 
@@ -2523,8 +2811,7 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
     #ifdef niEMAC_CACHEABLE
         if( niEMAC_CACHE_MAINTENANCE != 0 )
         {
-            /* Invalidate DMA-written data before the packet or its hidden
-             * network-buffer pointer is read by the CPU. */
+            /* Invalidate DMA-written data before the packet is read by the CPU. */
             prvCacheInvalidateByAddr( pucBuff, usLength );
         }
     #endif
