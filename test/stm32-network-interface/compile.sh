@@ -108,6 +108,7 @@ compile_flags=(
 
 sources=(
     "${repo_root}/source/portable/NetworkInterface/STM32/NetworkInterface.c"
+    "${repo_root}/source/portable/NetworkInterface/Common/phyHandling.c"
     "${driver_dir}/${hal_prefix}_hal_eth.c"
 )
 
@@ -128,4 +129,13 @@ if [ "${family}" = "F1" ]; then
         -include "${script_dir}/override-config.h" \
         -c "${repo_root}/source/portable/NetworkInterface/STM32/NetworkInterface.c" \
         -o "${build_dir}/NetworkInterface-overrides.o"
+fi
+
+if [ "${family}" = "N6" ]; then
+    echo "Compiling ${family}: NetworkInterface.c with RGMII enabled"
+    arm-none-eabi-gcc \
+        "${compile_flags[@]}" \
+        -DipconfigUSE_RGMII=1 \
+        -c "${repo_root}/source/portable/NetworkInterface/STM32/NetworkInterface.c" \
+        -o "${build_dir}/NetworkInterface-RGMII.o"
 fi

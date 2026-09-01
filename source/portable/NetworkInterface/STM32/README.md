@@ -40,15 +40,30 @@ names. All options accept `ipconfigENABLE` or `ipconfigDISABLE`.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `ipconfigUSE_RMII` | Enabled | Select RMII instead of MII. |
+| `ipconfigUSE_RMII` | Enabled unless RGMII is selected | Select RMII instead of MII. |
+| `ipconfigUSE_RGMII` | Disabled | Select the STM32N6 RGMII interface and permit 1000BASE-T negotiation. |
 | `ipconfigETHERNET_AN_ENABLE` | Enabled | Enable PHY auto-negotiation. |
 | `ipconfigETHERNET_AUTO_CROSS_ENABLE` | Enabled with auto-negotiation | Enable automatic MDI/MDI-X selection. |
 | `ipconfigETHERNET_CROSSED_LINK` | Enabled when automatic MDI/MDI-X is disabled | Select a crossed connection when automatic MDI/MDI-X is disabled. |
 | `ipconfigETHERNET_USE_100MB` | Enabled in fixed mode | Select 100 Mbit/s instead of 10 Mbit/s when auto-negotiation is disabled. |
 | `ipconfigETHERNET_USE_FULL_DUPLEX` | Enabled in fixed mode | Select full duplex instead of half duplex when auto-negotiation is disabled. |
 
+When both media options are disabled, the driver selects MII. RGMII is
+available only with the STM32N6 HAL and currently supports the RTL8211 PHY.
+The generic PHY layer continues to limit all other configurations to 100
+Mbit/s, including STM32N6 RMII configurations.
+
+The RTL8211 advertises 1000BASE-T full duplex as well as 10/100 Mbit/s
+fallback modes when RGMII and auto-negotiation are enabled. Fixed 1000BASE-T
+operation is intentionally unsupported because copper gigabit Ethernet uses
+auto-negotiation for master/slave resolution. If auto-negotiation is disabled,
+the existing 10/100 Mbit/s fixed-speed options continue to apply.
+
 The selected media mode must match the clocks and GPIOs configured by
-`HAL_ETH_MspInit()`.
+`HAL_ETH_MspInit()`. An RGMII board must also provide the PHY reset and strap
+configuration, 125 MHz clocking, and the required transmit/receive clock
+delays. Configure RTL8211 internal delays or Energy-Efficient Ethernet policy
+in board code when they are not established by hardware straps.
 
 ### Task and timeouts
 

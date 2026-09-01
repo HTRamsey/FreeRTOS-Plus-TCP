@@ -204,8 +204,12 @@
     #define ipconfigETHERNET_CROSSED_LINK    ( ipconfigENABLE && ipconfigIS_DISABLED( ipconfigETHERNET_AUTO_CROSS_ENABLE ) )
 #endif
 
+#ifndef ipconfigUSE_RGMII
+    #define ipconfigUSE_RGMII    ipconfigDISABLE
+#endif
+
 #ifndef ipconfigUSE_RMII
-    #define ipconfigUSE_RMII    ipconfigENABLE
+    #define ipconfigUSE_RMII    ( ipconfigENABLE && ipconfigIS_DISABLED( ipconfigUSE_RGMII ) )
 #endif
 
 #ifndef iptraceEMAC_TASK_STARTING
@@ -300,6 +304,18 @@
 
 #if ( ( ipconfigUSE_RMII != ipconfigENABLE ) && ( ipconfigUSE_RMII != ipconfigDISABLE ) )
     #error "ipconfigUSE_RMII must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ( ( ipconfigUSE_RGMII != ipconfigENABLE ) && ( ipconfigUSE_RGMII != ipconfigDISABLE ) )
+    #error "ipconfigUSE_RGMII must be ipconfigENABLE or ipconfigDISABLE"
+#endif
+
+#if ipconfigIS_ENABLED( ipconfigUSE_RMII ) && ipconfigIS_ENABLED( ipconfigUSE_RGMII )
+    #error "Select only one of RMII or RGMII"
+#endif
+
+#if !defined( niEMAC_STM32NX ) && ipconfigIS_ENABLED( ipconfigUSE_RGMII )
+    #error "RGMII is supported only by the STM32N6 Ethernet HAL"
 #endif
 
 #if ( ( niEMAC_USE_MPU != ipconfigENABLE ) && ( niEMAC_USE_MPU != ipconfigDISABLE ) )
@@ -728,6 +744,10 @@ static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject )
     BaseType_t xResult = pdFAIL;
 
     vPhyInitialise( pxPhyObject, ( xApplicationPhyReadHook_t ) prvPhyReadReg, ( xApplicationPhyWriteHook_t ) prvPhyWriteReg );
+
+    #if defined( niEMAC_STM32NX ) && ipconfigIS_ENABLED( ipconfigUSE_RGMII )
+        vPhySetMaxSpeed( pxPhyObject, PHY_SPEED_1000 );
+    #endif
 
     if( xPhyDiscover( pxPhyObject ) != 0 )
     {
@@ -1681,7 +1701,35 @@ static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
     if( pxPhyObject != NULL )
     {
         xMACConfig.DuplexMode = ( pxPhyObject->xPhyProperties.ucDuplex == PHY_DUPLEX_FULL ) ? ETH_FULLDUPLEX_MODE : ETH_HALFDUPLEX_MODE;
-        xMACConfig.Speed = ( pxPhyObject->xPhyProperties.ucSpeed == PHY_SPEED_10 ) ? ETH_SPEED_10M : ETH_SPEED_100M;
+
+        switch( pxPhyObject->xPhyProperties.ucSpeed )
+        {
+            case PHY_SPEED_10:
+                xMACConfig.Speed = ETH_SPEED_10M;
+                #if defined( niEMAC_STM32NX )
+                    xMACConfig.PortSelect = ENABLE;
+                #endif
+                break;
+
+            case PHY_SPEED_100:
+                xMACConfig.Speed = ETH_SPEED_100M;
+                #if defined( niEMAC_STM32NX )
+                    xMACConfig.PortSelect = ENABLE;
+                #endif
+                break;
+
+            #if defined( niEMAC_STM32NX )
+                case PHY_SPEED_1000:
+                    xMACConfig.Speed = ETH_SPEED_1000M;
+                    xMACConfig.PortSelect = DISABLE;
+                    break;
+            #endif
+
+            default:
+                FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: unsupported PHY speed %u\n",
+                                         ( unsigned int ) pxPhyObject->xPhyProperties.ucSpeed ) );
+                return pdFALSE;
+        }
     }
 
     xMACConfig.ChecksumOffload = ( FunctionalState ) ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM );
@@ -1729,6 +1777,7 @@ static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
                                       EthernetPhy_t * pxPhyObject )
 {
     BaseType_t xResult = pdFALSE;
+    BaseType_t xPhyResult;
 
     if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
     {
@@ -1740,12 +1789,12 @@ static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
     }
 
     #if ipconfigIS_ENABLED( ipconfigETHERNET_AN_ENABLE )
-        ( void ) xPhyStartAutoNegotiation( pxPhyObject, xPhyGetMask( pxPhyObject ) );
+        xPhyResult = xPhyStartAutoNegotiation( pxPhyObject, xPhyGetMask( pxPhyObject ) );
     #else
-        ( void ) xPhyFixedValue( pxPhyObject, xPhyGetMask( pxPhyObject ) );
+        xPhyResult = xPhyFixedValue( pxPhyObject, xPhyGetMask( pxPhyObject ) );
     #endif
 
-    if( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
+    if( ( xPhyResult == 0 ) && ( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) != pdFALSE ) )
     {
         xResult = pdTRUE;
     }
@@ -1768,7 +1817,13 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
     #endif
 
     pxEthHandle->Instance = niEMAC_ETH_INSTANCE;
-    pxEthHandle->Init.MediaInterface = ipconfigIS_ENABLED( ipconfigUSE_RMII ) ? HAL_ETH_RMII_MODE : HAL_ETH_MII_MODE;
+    #if defined( niEMAC_STM32NX ) && ipconfigIS_ENABLED( ipconfigUSE_RGMII )
+        pxEthHandle->Init.MediaInterface = HAL_ETH_RGMII_MODE;
+    #elif ipconfigIS_ENABLED( ipconfigUSE_RMII )
+        pxEthHandle->Init.MediaInterface = HAL_ETH_RMII_MODE;
+    #else
+        pxEthHandle->Init.MediaInterface = HAL_ETH_MII_MODE;
+    #endif
     pxEthHandle->Init.RxBuffLen = niEMAC_DATA_BUFFER_SIZE;
 
     /* RxBuffLen includes alignment padding, so compare the unpadded frame size
