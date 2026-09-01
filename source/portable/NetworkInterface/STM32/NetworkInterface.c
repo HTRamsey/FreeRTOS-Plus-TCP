@@ -396,7 +396,7 @@ typedef enum
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
-/* Phy Hooks */
+/* PHY Management */
 static BaseType_t prvPhyReadReg( BaseType_t xAddress,
                                  BaseType_t xRegister,
                                  uint32_t * pulValue );
@@ -404,8 +404,13 @@ static BaseType_t prvPhyWriteReg( BaseType_t xAddress,
                                   BaseType_t xRegister,
                                   uint32_t ulValue );
 
-/* Network Interface Access Hooks */
 static void prvForceRefreshPhyLinkStatus( EthernetPhy_t * pxPhyObject );
+static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject );
+static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
+                               NetworkInterface_t * pxInterface,
+                               EthernetPhy_t * pxPhyObject );
+
+/* Network Interface Access Hooks */
 static BaseType_t prvGetPhyLinkStatus( NetworkInterface_t * pxInterface );
 static BaseType_t prvNetworkInterfaceInitialise( NetworkInterface_t * pxInterface );
 static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
@@ -423,14 +428,20 @@ static __NO_RETURN portTASK_FUNCTION_PROTO( prvEMACHandlerTask,
                                             pvParameters );
 static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface );
 
-/* EMAC Init */
-static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
-                                        const EthernetPhy_t * pxPhyObject );
+/* EMAC Recovery */
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
                                                EthernetPhy_t * pxPhyObject,
                                                NetworkInterface_t * pxInterface );
+
+/* EMAC Init */
+static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
+                                        const EthernetPhy_t * pxPhyObject );
+static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
+                                      EthernetPhy_t * pxPhyObject );
 static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                                     NetworkInterface_t * pxInterface );
+
+/* MAC and Packet Filtering */
 static BaseType_t prvConfigureMACAddressFilter( ETH_HandleTypeDef * pxEthHandle );
 static BaseType_t prvInitMacAddresses( ETH_HandleTypeDef * pxEthHandle,
                                       NetworkInterface_t * pxInterface );
@@ -439,12 +450,6 @@ static BaseType_t prvRestoreMACAddressFilters( ETH_HandleTypeDef * pxEthHandle )
     static void prvInitPacketFilter( ETH_HandleTypeDef * pxEthHandle,
                                      const NetworkInterface_t * const pxInterface );
 #endif
-static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject );
-static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
-                               NetworkInterface_t * pxInterface,
-                               EthernetPhy_t * pxPhyObject );
-
-/* MAC Filtering Helpers */
 static uint32_t prvCalcCrc32( const uint8_t * const pucMACAddr );
 static uint8_t prvGetMacHashIndex( const uint8_t * const pucMACAddr );
 static void prvHAL_ETH_SetDestMACAddrMatch( ETH_TypeDef * const pxEthInstance,
@@ -467,8 +472,6 @@ static void prvResetMACAddressFilters( ETH_HandleTypeDef * pxEthHandle );
 
 /* EMAC Helpers */
 static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle );
-static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
-                                      EthernetPhy_t * pxPhyObject );
 static void prvReleaseNetworkBufferDescriptor( NetworkBufferDescriptor_t * const pxDescriptor );
 static void prvSendRxEvent( NetworkBufferDescriptor_t * const pxDescriptor );
 static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
@@ -477,6 +480,8 @@ static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
 #if ipconfigIS_ENABLED( ipconfigETHERNET_DRIVER_FILTERS_PACKETS )
     static BaseType_t prvPassesPacketFilter( const NetworkBufferDescriptor_t * const pxDescriptor );
 #endif
+
+/* Cache Maintenance Helpers */
 #ifdef niEMAC_CACHEABLE
     static uintptr_t prvGetCacheAlignedRange( const void * pvAddress,
                                               size_t uxLength,
@@ -520,6 +525,10 @@ static uint8_t ucSrcMatchAddresses[ niEMAC_MAC_SRC_MATCH_COUNT ][ ipMAC_ADDRESS_
 static uint32_t ulHashTable[ niEMAC_ADDRESS_HASH_BITS / 32 ];
 static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
 
+/*---------------------------------------------------------------------------*/
+/*===========================================================================*/
+/*                         Cache Maintenance Helpers                         */
+/*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
 #ifdef niEMAC_CACHEABLE
@@ -580,7 +589,7 @@ static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
-/*                              Phy Hooks                                    */
+/*                              PHY Management                              */
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
@@ -615,10 +624,6 @@ static BaseType_t prvPhyWriteReg( BaseType_t xAddress,
 }
 
 /*---------------------------------------------------------------------------*/
-/*===========================================================================*/
-/*                      Network Interface Access Hooks                       */
-/*===========================================================================*/
-/*---------------------------------------------------------------------------*/
 
 static void prvForceRefreshPhyLinkStatus( EthernetPhy_t * pxPhyObject )
 {
@@ -627,6 +632,77 @@ static void prvForceRefreshPhyLinkStatus( EthernetPhy_t * pxPhyObject )
     ( void ) xPhyCheckLinkStatus( pxPhyObject, pdFALSE );
 }
 
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject )
+{
+    BaseType_t xResult = pdFAIL;
+
+    vPhyInitialise( pxPhyObject, ( xApplicationPhyReadHook_t ) prvPhyReadReg, ( xApplicationPhyWriteHook_t ) prvPhyWriteReg );
+
+    if( xPhyDiscover( pxPhyObject ) != 0 )
+    {
+        xResult = pdPASS;
+    }
+
+    return xResult;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
+                               NetworkInterface_t * pxInterface,
+                               EthernetPhy_t * pxPhyObject )
+{
+    BaseType_t xResult = pdFALSE;
+
+    if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
+    {
+        const PhyProperties_t xPhyProperties =
+        {
+            #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
+                .ucSpeed  = PHY_SPEED_AUTO,
+                .ucDuplex = PHY_DUPLEX_AUTO,
+            #else
+                .ucSpeed  = ipconfigIS_ENABLED( niEMAC_USE_100MB ) ? PHY_SPEED_100 : PHY_SPEED_10,
+                .ucDuplex = ipconfigIS_ENABLED( niEMAC_USE_FULL_DUPLEX ) ? PHY_DUPLEX_FULL : PHY_DUPLEX_HALF,
+            #endif
+
+            #if ipconfigIS_ENABLED( niEMAC_AUTO_CROSS )
+                .ucMDI_X  = PHY_MDIX_AUTO,
+            #elif ipconfigIS_ENABLED( niEMAC_CROSSED_LINK )
+                .ucMDI_X  = PHY_MDIX_CROSSED,
+            #else
+                .ucMDI_X  = PHY_MDIX_DIRECT,
+            #endif
+        };
+
+        #if ipconfigIS_DISABLED( niEMAC_AUTO_NEGOTIATION )
+            pxPhyObject->xPhyPreferences.ucSpeed = xPhyProperties.ucSpeed;
+            pxPhyObject->xPhyPreferences.ucDuplex = xPhyProperties.ucDuplex;
+            pxPhyObject->xPhyProperties = xPhyProperties;
+        #endif
+
+        if( xPhyConfigure( pxPhyObject, &xPhyProperties ) == 0 )
+        {
+            if( prvMacUpdateConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
+            {
+                xResult = pdTRUE;
+            }
+        }
+    }
+    else
+    {
+        xResult = pdTRUE;
+    }
+
+    return xResult;
+}
+
+/*---------------------------------------------------------------------------*/
+/*===========================================================================*/
+/*                      Network Interface Access Hooks                       */
+/*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvGetPhyLinkStatus( NetworkInterface_t * pxInterface )
@@ -1295,66 +1371,8 @@ static BaseType_t prvEMACTaskStart( NetworkInterface_t * pxInterface )
 
 /*---------------------------------------------------------------------------*/
 /*===========================================================================*/
-/*                               EMAC Init                                   */
+/*                               EMAC Recovery                               */
 /*===========================================================================*/
-/*---------------------------------------------------------------------------*/
-
-static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
-                                        const EthernetPhy_t * pxPhyObject )
-{
-    ETH_MACConfigTypeDef xMACConfig = { 0 };
-
-    if( HAL_ETH_GetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
-    {
-        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_GetMACConfig failed\n" ) );
-        return pdFALSE;
-    }
-
-    if( pxPhyObject != NULL )
-    {
-        xMACConfig.DuplexMode = ( pxPhyObject->xPhyProperties.ucDuplex == PHY_DUPLEX_FULL ) ? ETH_FULLDUPLEX_MODE : ETH_HALFDUPLEX_MODE;
-        xMACConfig.Speed = ( pxPhyObject->xPhyProperties.ucSpeed == PHY_SPEED_10 ) ? ETH_SPEED_10M : ETH_SPEED_100M;
-    }
-
-    xMACConfig.ChecksumOffload = ( FunctionalState ) ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM );
-    xMACConfig.CRCStripTypePacket = DISABLE;
-    xMACConfig.AutomaticPadCRCStrip = ENABLE;
-    xMACConfig.RetryTransmission = ENABLE;
-
-    if( HAL_ETH_SetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
-    {
-        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_SetMACConfig failed\n" ) );
-        return pdFALSE;
-    }
-
-    ETH_DMAConfigTypeDef xDMAConfig = { 0 };
-
-    if( HAL_ETH_GetDMAConfig( pxEthHandle, &xDMAConfig ) != HAL_OK )
-    {
-        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_GetDMAConfig failed\n" ) );
-        return pdFALSE;
-    }
-
-    #if defined( niEMAC_STM32FX )
-        xDMAConfig.EnhancedDescriptorFormat = ( FunctionalState ) ( ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM ) || ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM ) );
-    #elif defined( niEMAC_STM32HX )
-        xDMAConfig.SecondPacketOperate = ENABLE;
-    #elif defined( niEMAC_STM32NX )
-        for( uint32_t ulChannel = 0; ulChannel < ETH_DMA_CH_CNT; ulChannel++ )
-        {
-            xDMAConfig.DMACh[ ulChannel ].SecondPacketOperate = ENABLE;
-        }
-    #endif /* if defined( niEMAC_STM32FX ) */
-
-    if( HAL_ETH_SetDMAConfig( pxEthHandle, &xDMAConfig ) != HAL_OK )
-    {
-        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_SetDMAConfig failed\n" ) );
-        return pdFALSE;
-    }
-
-    return pdTRUE;
-}
-
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
@@ -1499,6 +1517,98 @@ static BaseType_t prvRecoverFromCriticalError( ETH_HandleTypeDef * pxEthHandle,
 }
 
 /*---------------------------------------------------------------------------*/
+/*===========================================================================*/
+/*                                 EMAC Init                                 */
+/*===========================================================================*/
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvApplyMACDMAConfig( ETH_HandleTypeDef * pxEthHandle,
+                                        const EthernetPhy_t * pxPhyObject )
+{
+    ETH_MACConfigTypeDef xMACConfig = { 0 };
+
+    if( HAL_ETH_GetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
+    {
+        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_GetMACConfig failed\n" ) );
+        return pdFALSE;
+    }
+
+    if( pxPhyObject != NULL )
+    {
+        xMACConfig.DuplexMode = ( pxPhyObject->xPhyProperties.ucDuplex == PHY_DUPLEX_FULL ) ? ETH_FULLDUPLEX_MODE : ETH_HALFDUPLEX_MODE;
+        xMACConfig.Speed = ( pxPhyObject->xPhyProperties.ucSpeed == PHY_SPEED_10 ) ? ETH_SPEED_10M : ETH_SPEED_100M;
+    }
+
+    xMACConfig.ChecksumOffload = ( FunctionalState ) ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM );
+    xMACConfig.CRCStripTypePacket = DISABLE;
+    xMACConfig.AutomaticPadCRCStrip = ENABLE;
+    xMACConfig.RetryTransmission = ENABLE;
+
+    if( HAL_ETH_SetMACConfig( pxEthHandle, &xMACConfig ) != HAL_OK )
+    {
+        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_SetMACConfig failed\n" ) );
+        return pdFALSE;
+    }
+
+    ETH_DMAConfigTypeDef xDMAConfig = { 0 };
+
+    if( HAL_ETH_GetDMAConfig( pxEthHandle, &xDMAConfig ) != HAL_OK )
+    {
+        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_GetDMAConfig failed\n" ) );
+        return pdFALSE;
+    }
+
+    #if defined( niEMAC_STM32FX )
+        xDMAConfig.EnhancedDescriptorFormat = ( FunctionalState ) ( ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_RX_IP_CHECKSUM ) || ipconfigIS_ENABLED( ipconfigDRIVER_INCLUDED_TX_IP_CHECKSUM ) );
+    #elif defined( niEMAC_STM32HX )
+        xDMAConfig.SecondPacketOperate = ENABLE;
+    #elif defined( niEMAC_STM32NX )
+        for( uint32_t ulChannel = 0; ulChannel < ETH_DMA_CH_CNT; ulChannel++ )
+        {
+            xDMAConfig.DMACh[ ulChannel ].SecondPacketOperate = ENABLE;
+        }
+    #endif /* if defined( niEMAC_STM32FX ) */
+
+    if( HAL_ETH_SetDMAConfig( pxEthHandle, &xDMAConfig ) != HAL_OK )
+    {
+        FreeRTOS_debug_printf( ( "prvApplyMACDMAConfig: HAL_ETH_SetDMAConfig failed\n" ) );
+        return pdFALSE;
+    }
+
+    return pdTRUE;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
+                                      EthernetPhy_t * pxPhyObject )
+{
+    BaseType_t xResult = pdFALSE;
+
+    if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
+    {
+        if( HAL_ETH_Stop_IT( pxEthHandle ) != HAL_OK )
+        {
+            FreeRTOS_debug_printf( ( "prvMacUpdateConfig: HAL_ETH_Stop_IT failed\n" ) );
+            return pdFALSE;
+        }
+    }
+
+    #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
+        ( void ) xPhyStartAutoNegotiation( pxPhyObject, xPhyGetMask( pxPhyObject ) );
+    #else
+        ( void ) xPhyFixedValue( pxPhyObject, xPhyGetMask( pxPhyObject ) );
+    #endif
+
+    if( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
+    {
+        xResult = pdTRUE;
+    }
+
+    return xResult;
+}
+
+/*---------------------------------------------------------------------------*/
 
 static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
                                     NetworkInterface_t * pxInterface )
@@ -1606,6 +1716,10 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
     return xResult;
 }
 
+/*---------------------------------------------------------------------------*/
+/*===========================================================================*/
+/*                         MAC and Packet Filtering                          */
+/*===========================================================================*/
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvConfigureMACAddressFilter( ETH_HandleTypeDef * pxEthHandle )
@@ -1891,75 +2005,6 @@ static BaseType_t prvRestoreMACAddressFilters( ETH_HandleTypeDef * pxEthHandle )
 
 /*---------------------------------------------------------------------------*/
 
-static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject )
-{
-    BaseType_t xResult = pdFAIL;
-
-    vPhyInitialise( pxPhyObject, ( xApplicationPhyReadHook_t ) prvPhyReadReg, ( xApplicationPhyWriteHook_t ) prvPhyWriteReg );
-
-    if( xPhyDiscover( pxPhyObject ) != 0 )
-    {
-        xResult = pdPASS;
-    }
-
-    return xResult;
-}
-
-static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
-                               NetworkInterface_t * pxInterface,
-                               EthernetPhy_t * pxPhyObject )
-{
-    BaseType_t xResult = pdFALSE;
-
-    if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
-    {
-        const PhyProperties_t xPhyProperties =
-        {
-            #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
-                .ucSpeed  = PHY_SPEED_AUTO,
-                .ucDuplex = PHY_DUPLEX_AUTO,
-            #else
-                .ucSpeed  = ipconfigIS_ENABLED( niEMAC_USE_100MB ) ? PHY_SPEED_100 : PHY_SPEED_10,
-                .ucDuplex = ipconfigIS_ENABLED( niEMAC_USE_FULL_DUPLEX ) ? PHY_DUPLEX_FULL : PHY_DUPLEX_HALF,
-            #endif
-
-            #if ipconfigIS_ENABLED( niEMAC_AUTO_CROSS )
-                .ucMDI_X  = PHY_MDIX_AUTO,
-            #elif ipconfigIS_ENABLED( niEMAC_CROSSED_LINK )
-                .ucMDI_X  = PHY_MDIX_CROSSED,
-            #else
-                .ucMDI_X  = PHY_MDIX_DIRECT,
-            #endif
-        };
-
-        #if ipconfigIS_DISABLED( niEMAC_AUTO_NEGOTIATION )
-            pxPhyObject->xPhyPreferences.ucSpeed = xPhyProperties.ucSpeed;
-            pxPhyObject->xPhyPreferences.ucDuplex = xPhyProperties.ucDuplex;
-            pxPhyObject->xPhyProperties = xPhyProperties;
-        #endif
-
-        if( xPhyConfigure( pxPhyObject, &xPhyProperties ) == 0 )
-        {
-            if( prvMacUpdateConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
-            {
-                xResult = pdTRUE;
-            }
-        }
-    }
-    else
-    {
-        xResult = pdTRUE;
-    }
-
-    return xResult;
-}
-
-/*---------------------------------------------------------------------------*/
-/*===========================================================================*/
-/*                           MAC Filtering Helpers                           */
-/*===========================================================================*/
-/*---------------------------------------------------------------------------*/
-
 /* Compute the CRC32 of the given MAC address as per IEEE 802.3 CRC32 */
 static uint32_t prvCalcCrc32( const uint8_t * const pucMACAddr )
 {
@@ -2203,7 +2248,6 @@ static void prvResetMACAddressFilters( ETH_HandleTypeDef * pxEthHandle )
 /*                              EMAC Helpers                                 */
 /*===========================================================================*/
 /*---------------------------------------------------------------------------*/
-
 static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle )
 {
     if( xSemaphoreTake( xTxMutex, pdMS_TO_TICKS( niEMAC_TX_MAX_BLOCK_TIME_MS ) ) != pdFALSE )
@@ -2245,36 +2289,6 @@ static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle )
     {
         FreeRTOS_debug_printf( ( "prvReleaseTxPacket: Failed\n" ) );
     }
-}
-
-/*---------------------------------------------------------------------------*/
-
-static BaseType_t prvMacUpdateConfig( ETH_HandleTypeDef * pxEthHandle,
-                                      EthernetPhy_t * pxPhyObject )
-{
-    BaseType_t xResult = pdFALSE;
-
-    if( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_STARTED )
-    {
-        if( HAL_ETH_Stop_IT( pxEthHandle ) != HAL_OK )
-        {
-            FreeRTOS_debug_printf( ( "prvMacUpdateConfig: HAL_ETH_Stop_IT failed\n" ) );
-            return pdFALSE;
-        }
-    }
-
-    #if ipconfigIS_ENABLED( niEMAC_AUTO_NEGOTIATION )
-        ( void ) xPhyStartAutoNegotiation( pxPhyObject, xPhyGetMask( pxPhyObject ) );
-    #else
-        ( void ) xPhyFixedValue( pxPhyObject, xPhyGetMask( pxPhyObject ) );
-    #endif
-
-    if( prvApplyMACDMAConfig( pxEthHandle, pxPhyObject ) != pdFALSE )
-    {
-        xResult = pdTRUE;
-    }
-
-    return xResult;
 }
 
 /*---------------------------------------------------------------------------*/
