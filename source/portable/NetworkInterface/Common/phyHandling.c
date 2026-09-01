@@ -82,6 +82,7 @@
 #define PHYREG_10_PHYSTS           0x10U    /* 16 PHY status register Offset */
 #define phyREG_1A_PHYSR            0x1AU    /* PHY-specific status register. */
 #define phyREG_19_PHYCR            0x19U    /* 25 RW PHY Control Register */
+#define phyREG_1B_SCSIR            0x1BU    /* 27 RW Special Control/Status Indication Register. */
 #define phyREG_1F_PHYSPCS          0x1FU    /* 31 RW PHY Special Control Status */
 
 /* Bit fields for 'phyREG_00_BMCR', the 'Basic Mode Control Register'. */
@@ -107,6 +108,11 @@
 /* Bit fields for 'phyREG_19_PHYCR', the 'PHY Control Register'. */
 #define PHYCR_MDIX_EN              0x8000U  /* Enable Auto MDIX. */
 #define PHYCR_MDIX_FORCE           0x4000U  /* Force MDIX crossed. */
+
+/* LAN8742A bit fields for 'phyREG_1B_SCSIR'. */
+#define phySCSIR_MDIX_OVERRIDE     0x8000U
+#define phySCSIR_MDIX_AUTO         0x4000U
+#define phySCSIR_MDIX_STATE        0x2000U
 
 #define phyBMSR_AN_COMPLETE        0x0020U  /* Auto-Negotiation process completed */
 
@@ -193,7 +199,6 @@ static BaseType_t xHas_19_PHYCR( uint32_t ulPhyID )
 
     switch( ulPhyID )
     {
-        case PHY_ID_LAN8742A:
         case PHY_ID_DP83848I:
         case PHY_ID_DP83822HF:
         case PHY_ID_TM4C129X:
@@ -207,6 +212,58 @@ static BaseType_t xHas_19_PHYCR( uint32_t ulPhyID )
     }
 
     return xResult;
+}
+/*-----------------------------------------------------------*/
+
+static void prvConfigureMDIX( EthernetPhy_t * pxPhyObject,
+                              BaseType_t xPhyAddress,
+                              uint32_t ulPhyID,
+                              uint8_t ucMDIX )
+{
+    BaseType_t xRegister;
+    uint32_t ulControlMask;
+    uint32_t ulAutoMask;
+    uint32_t ulForceMask;
+    uint32_t ulOverrideMask = 0U;
+    uint32_t ulPhyControl = 0U;
+
+    if( ulPhyID == PHY_ID_LAN8742A )
+    {
+        xRegister = phyREG_1B_SCSIR;
+        ulControlMask = phySCSIR_MDIX_OVERRIDE | phySCSIR_MDIX_AUTO | phySCSIR_MDIX_STATE;
+        ulAutoMask = phySCSIR_MDIX_AUTO;
+        ulForceMask = phySCSIR_MDIX_STATE;
+        ulOverrideMask = phySCSIR_MDIX_OVERRIDE;
+    }
+    else if( xHas_19_PHYCR( ulPhyID ) != pdFALSE )
+    {
+        xRegister = phyREG_19_PHYCR;
+        ulControlMask = PHYCR_MDIX_EN | PHYCR_MDIX_FORCE;
+        ulAutoMask = PHYCR_MDIX_EN;
+        ulForceMask = PHYCR_MDIX_FORCE;
+    }
+    else
+    {
+        return;
+    }
+
+    if( pxPhyObject->fnPhyRead( xPhyAddress, xRegister, &ulPhyControl ) == 0 )
+    {
+        ulPhyControl &= ~ulControlMask;
+        ulPhyControl |= ulOverrideMask;
+
+        if( ucMDIX == PHY_MDIX_AUTO )
+        {
+            ulPhyControl |= ulAutoMask;
+        }
+        else if( ucMDIX != PHY_MDIX_CROSSED )
+        {
+            /* Force crossed PHY pairs when using a direct RJ45 cable. */
+            ulPhyControl |= ulForceMask;
+        }
+
+        pxPhyObject->fnPhyWrite( xPhyAddress, xRegister, ulPhyControl );
+    }
 }
 /*-----------------------------------------------------------*/
 
@@ -522,33 +579,7 @@ BaseType_t xPhyConfigure( EthernetPhy_t * pxPhyObject,
             ulConfig &= ~phyBMCR_FULL_DUPLEX;
         }
 
-        if( xHas_19_PHYCR( ulPhyID ) )
-        {
-            uint32_t ulPhyControl;
-            /* Read PHY Control register. */
-            pxPhyObject->fnPhyRead( xPhyAddress, phyREG_19_PHYCR, &ulPhyControl );
-
-            /* Clear bits which might get set: */
-            ulPhyControl &= ~( PHYCR_MDIX_EN | PHYCR_MDIX_FORCE );
-
-            if( pxPhyProperties->ucMDI_X == PHY_MDIX_AUTO )
-            {
-                ulPhyControl |= PHYCR_MDIX_EN;
-            }
-            else if( pxPhyProperties->ucMDI_X == PHY_MDIX_CROSSED )
-            {
-                /* Force direct link = Use crossed RJ45 cable. */
-                ulPhyControl &= ~PHYCR_MDIX_FORCE;
-            }
-            else
-            {
-                /* Force crossed link = Use direct RJ45 cable. */
-                ulPhyControl |= PHYCR_MDIX_FORCE;
-            }
-
-            /* update PHY Control Register. */
-            pxPhyObject->fnPhyWrite( xPhyAddress, phyREG_19_PHYCR, ulPhyControl );
-        }
+        prvConfigureMDIX( pxPhyObject, xPhyAddress, ulPhyID, pxPhyProperties->ucMDI_X );
 
         FreeRTOS_printf( ( "+TCP: advertise: %04X config %04X\n", ( unsigned int ) ulAdvertise, ( unsigned int ) ulConfig ) );
     }
@@ -929,7 +960,10 @@ BaseType_t xPhyCheckLinkStatus( EthernetPhy_t * pxPhyObject,
 
             if( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulStatus ) == 0 )
             {
-                if( !!( pxPhyObject->ulLinkStatusMask & ulBitMask ) != !!( ulStatus & phyBMSR_LINK_STATUS ) )
+                /* The link-status bit is latch-low. Read BMSR again to get the
+                 * current state after clearing any latched link-loss event. */
+                if( ( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulStatus ) == 0 ) &&
+                    ( !!( pxPhyObject->ulLinkStatusMask & ulBitMask ) != !!( ulStatus & phyBMSR_LINK_STATUS ) ) )
                 {
                     if( ( ulStatus & phyBMSR_LINK_STATUS ) != 0 )
                     {

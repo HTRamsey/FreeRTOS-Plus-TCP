@@ -492,7 +492,6 @@ static BaseType_t prvPhyWriteReg( BaseType_t xAddress,
 static void prvForceRefreshPhyLinkStatus( EthernetPhy_t * pxPhyObject );
 static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject );
 static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
-                               NetworkInterface_t * pxInterface,
                                EthernetPhy_t * pxPhyObject );
 
 /* Network Interface Access Hooks */
@@ -558,10 +557,14 @@ static void prvResetMACAddressFilters( ETH_HandleTypeDef * pxEthHandle );
 /* EMAC Helpers */
 static void prvReleaseTxPacket( ETH_HandleTypeDef * pxEthHandle );
 static void prvReleaseNetworkBufferDescriptor( NetworkBufferDescriptor_t * const pxDescriptor );
+static void prvDiscardRxFrame( NetworkBufferDescriptor_t ** ppxStartDescriptor,
+                               NetworkBufferDescriptor_t ** ppxEndDescriptor,
+                               NetworkBufferDescriptor_t * pxCurrentDescriptor );
 static void prvSendRxEvent( NetworkBufferDescriptor_t * const pxDescriptor );
 static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
                                    NetworkInterface_t * pxInterface,
                                    NetworkBufferDescriptor_t * pxDescriptor );
+static void prvNotifyEMACTaskFromISR( eMAC_IF_EVENT eEvents );
 
 /* Cache Maintenance Helpers */
 #ifdef niEMAC_CACHEABLE
@@ -760,12 +763,11 @@ static BaseType_t prvPhyInit( EthernetPhy_t * pxPhyObject )
 /*---------------------------------------------------------------------------*/
 
 static BaseType_t prvPhyStart( ETH_HandleTypeDef * pxEthHandle,
-                               NetworkInterface_t * pxInterface,
                                EthernetPhy_t * pxPhyObject )
 {
     BaseType_t xResult = pdFALSE;
 
-    if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
+    if( xPhyIsLinkUp( pxPhyObject ) == pdFALSE )
     {
         const PhyProperties_t xPhyProperties =
         {
@@ -818,14 +820,7 @@ static BaseType_t prvGetPhyLinkStatus( NetworkInterface_t * pxInterface )
 {
     ( void ) pxInterface;
 
-    BaseType_t xReturn = pdFALSE;
-
-    if( xPhyObject.ulLinkStatusMask != 0U )
-    {
-        xReturn = pdTRUE;
-    }
-
-    return xReturn;
+    return xPhyIsLinkUp( &xPhyObject );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -866,7 +861,7 @@ static BaseType_t prvNetworkInterfaceInitialise( NetworkInterface_t * pxInterfac
 
         case eMacPhyStart:
 
-            if( prvPhyStart( pxEthHandle, pxInterface, pxPhyObject ) == pdFALSE )
+            if( prvPhyStart( pxEthHandle, pxPhyObject ) == pdFALSE )
             {
                 FreeRTOS_debug_printf( ( "prvNetworkInterfaceInitialise: eMacPhyStart failed\n" ) );
                 break;
@@ -904,7 +899,7 @@ static BaseType_t prvNetworkInterfaceInitialise( NetworkInterface_t * pxInterfac
 
             prvForceRefreshPhyLinkStatus( pxPhyObject );
 
-            if( prvGetPhyLinkStatus( pxInterface ) != pdTRUE )
+            if( xPhyIsLinkUp( pxPhyObject ) != pdTRUE )
             {
                 FreeRTOS_debug_printf( ( "prvNetworkInterfaceInitialise: eMacInitComplete failed\n" ) );
                 break;
@@ -923,6 +918,7 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
                                              BaseType_t xReleaseAfterSend )
 {
     BaseType_t xResult = pdFAIL;
+    ( void ) pxInterface;
 
     /* Zero-Copy Only */
     configASSERT( xReleaseAfterSend == pdTRUE );
@@ -941,7 +937,7 @@ static BaseType_t prvNetworkInterfaceOutput( NetworkInterface_t * pxInterface,
             break;
         }
 
-        if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
+        if( xPhyIsLinkUp( &xPhyObject ) == pdFALSE )
         {
             FreeRTOS_debug_printf( ( "xNetworkInterfaceOutput: Link Down\n" ) );
             break;
@@ -1351,7 +1347,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
         {
             if( prvRecoverFromCriticalError( pxEthHandle, pxPhyObject ) != pdFALSE )
             {
-                if( prvGetPhyLinkStatus( pxInterface ) == pdFALSE )
+                if( xPhyIsLinkUp( pxPhyObject ) == pdFALSE )
                 {
                     xRecoveryRequired = pdFALSE;
                 }
@@ -1369,7 +1365,7 @@ static portTASK_FUNCTION( prvEMACHandlerTask, pvParameters )
 
         const BaseType_t xLinkStatusChanged = xPhyCheckLinkStatus( pxPhyObject, xResult );
 
-        if( prvGetPhyLinkStatus( pxInterface ) != pdFALSE )
+        if( xPhyIsLinkUp( pxPhyObject ) != pdFALSE )
         {
             if( ( xRecoveryRequired == pdFALSE ) &&
                 ( HAL_ETH_GetState( pxEthHandle ) == HAL_ETH_STATE_READY ) )
@@ -2485,6 +2481,40 @@ static void prvReleaseNetworkBufferDescriptor( NetworkBufferDescriptor_t * const
 
 /*---------------------------------------------------------------------------*/
 
+static void prvDiscardRxFrame( NetworkBufferDescriptor_t ** ppxStartDescriptor,
+                               NetworkBufferDescriptor_t ** ppxEndDescriptor,
+                               NetworkBufferDescriptor_t * pxCurrentDescriptor )
+{
+    NetworkBufferDescriptor_t * pxStartDescriptor = NULL;
+
+    if( ppxStartDescriptor != NULL )
+    {
+        pxStartDescriptor = *ppxStartDescriptor;
+        *ppxStartDescriptor = NULL;
+    }
+
+    if( ppxEndDescriptor != NULL )
+    {
+        *ppxEndDescriptor = NULL;
+    }
+
+    if( pxStartDescriptor != NULL )
+    {
+        prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
+    }
+
+    /* HAL supplies the current descriptor before linking it into the partial
+     * frame, so it must be released separately. */
+    if( ( pxCurrentDescriptor != NULL ) && ( pxCurrentDescriptor != pxStartDescriptor ) )
+    {
+        prvReleaseNetworkBufferDescriptor( pxCurrentDescriptor );
+    }
+
+    xDropCurrentRxFrame = pdTRUE;
+}
+
+/*---------------------------------------------------------------------------*/
+
 static void prvSendRxEvent( NetworkBufferDescriptor_t * const pxDescriptor )
 {
     const IPStackEvent_t xRxEvent =
@@ -2610,6 +2640,19 @@ static BaseType_t prvAcceptPacket( ETH_HandleTypeDef * pxEthHandle,
 }
 
 /*---------------------------------------------------------------------------*/
+
+static void prvNotifyEMACTaskFromISR( eMAC_IF_EVENT eEvents )
+{
+    if( ( xEMACTaskHandle != NULL ) && ( eEvents != eMacEventNone ) )
+    {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        ( void ) xTaskNotifyFromISR( xEMACTaskHandle, eEvents, eSetBits, &xHigherPriorityTaskWoken );
+        xSwitchRequired |= xHigherPriorityTaskWoken;
+    }
+}
+
+/*---------------------------------------------------------------------------*/
 /*===========================================================================*/
 /*                              IRQ Handlers                                 */
 /*===========================================================================*/
@@ -2675,12 +2718,7 @@ void HAL_ETH_ErrorCallback( ETH_HandleTypeDef * pxEthHandle )
         eErrorEvents |= eMacEventErrMac;
     }
 
-    if( ( xEMACTaskHandle != NULL ) && ( eErrorEvents != eMacEventNone ) )
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        ( void ) xTaskNotifyFromISR( xEMACTaskHandle, eErrorEvents, eSetBits, &xHigherPriorityTaskWoken );
-        xSwitchRequired |= xHigherPriorityTaskWoken;
-    }
+    prvNotifyEMACTaskFromISR( eErrorEvents );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2695,12 +2733,7 @@ void HAL_ETH_RxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 
     iptraceNETWORK_INTERFACE_RECEIVE();
 
-    if( xEMACTaskHandle != NULL )
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        ( void ) xTaskNotifyFromISR( xEMACTaskHandle, eMacEventRx, eSetBits, &xHigherPriorityTaskWoken );
-        xSwitchRequired |= xHigherPriorityTaskWoken;
-    }
+    prvNotifyEMACTaskFromISR( eMacEventRx );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2715,12 +2748,7 @@ void HAL_ETH_TxCpltCallback( ETH_HandleTypeDef * pxEthHandle )
 
     iptraceNETWORK_INTERFACE_TRANSMIT();
 
-    if( xEMACTaskHandle != NULL )
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        ( void ) xTaskNotifyFromISR( xEMACTaskHandle, eMacEventTx, eSetBits, &xHigherPriorityTaskWoken );
-        xSwitchRequired |= xHigherPriorityTaskWoken;
-    }
+    prvNotifyEMACTaskFromISR( eMacEventTx );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2765,41 +2793,28 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
                              uint8_t * pucBuff,
                              uint16_t usLength )
 {
-    if( ( ppvStart == NULL ) || ( ppvEnd == NULL ) )
+    NetworkBufferDescriptor_t ** const ppxStartDescriptor = ( ppvStart != NULL ) ? ( NetworkBufferDescriptor_t ** ) ppvStart : NULL;
+    NetworkBufferDescriptor_t ** const ppxEndDescriptor = ( ppvEnd != NULL ) ? ( NetworkBufferDescriptor_t ** ) ppvEnd : NULL;
+
+    if( ( ppxStartDescriptor == NULL ) || ( ppxEndDescriptor == NULL ) )
     {
+        NetworkBufferDescriptor_t * pxCurDescriptor = NULL;
+
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Invalid callback context\n" ) );
-        xDropCurrentRxFrame = pdTRUE;
 
         if( pucBuff != NULL )
         {
-            NetworkBufferDescriptor_t * const pxCurDescriptor = pxPacketBuffer_to_NetworkBuffer( ( const void * ) pucBuff );
-
-            if( pxCurDescriptor != NULL )
-            {
-                prvReleaseNetworkBufferDescriptor( pxCurDescriptor );
-            }
+            pxCurDescriptor = pxPacketBuffer_to_NetworkBuffer( ( const void * ) pucBuff );
         }
 
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, pxCurDescriptor );
         return;
     }
-
-    NetworkBufferDescriptor_t ** const ppxStartDescriptor = ( NetworkBufferDescriptor_t ** ) ppvStart;
-    NetworkBufferDescriptor_t ** const ppxEndDescriptor = ( NetworkBufferDescriptor_t ** ) ppvEnd;
 
     if( pucBuff == NULL )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: NULL buffer pointer\n" ) );
-
-        if( *ppxStartDescriptor != NULL )
-        {
-            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
-
-            *ppxStartDescriptor = NULL;
-            *ppxEndDescriptor = NULL;
-            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
-        }
-
-        xDropCurrentRxFrame = pdTRUE;
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, NULL );
         return;
     }
 
@@ -2808,17 +2823,7 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
     if( pxCurDescriptor == NULL )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Invalid buffer descriptor\n" ) );
-
-        if( *ppxStartDescriptor != NULL )
-        {
-            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
-
-            *ppxStartDescriptor = NULL;
-            *ppxEndDescriptor = NULL;
-            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
-        }
-
-        xDropCurrentRxFrame = pdTRUE;
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, NULL );
         return;
     }
 
@@ -2826,18 +2831,7 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
         ( usLength > pxCurDescriptor->xDataLength ) )
     {
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Invalid buffer length\n" ) );
-
-        if( *ppxStartDescriptor != NULL )
-        {
-            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
-
-            *ppxStartDescriptor = NULL;
-            *ppxEndDescriptor = NULL;
-            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
-        }
-
-        prvReleaseNetworkBufferDescriptor( pxCurDescriptor );
-        xDropCurrentRxFrame = pdTRUE;
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, pxCurDescriptor );
         return;
     }
 
@@ -2851,29 +2845,14 @@ void HAL_ETH_RxLinkCallback( void ** ppvStart,
 
     if( xDropCurrentRxFrame != pdFALSE )
     {
-        if( *ppxStartDescriptor != NULL )
-        {
-            NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
-
-            *ppxStartDescriptor = NULL;
-            *ppxEndDescriptor = NULL;
-            prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
-        }
-
-        prvReleaseNetworkBufferDescriptor( pxCurDescriptor );
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, pxCurDescriptor );
         return;
     }
 
     if( *ppxStartDescriptor != NULL )
     {
-        NetworkBufferDescriptor_t * const pxStartDescriptor = *ppxStartDescriptor;
-
         FreeRTOS_debug_printf( ( "HAL_ETH_RxLinkCallback: Multi-buffer packets are unsupported\n" ) );
-        *ppxStartDescriptor = NULL;
-        *ppxEndDescriptor = NULL;
-        xDropCurrentRxFrame = pdTRUE;
-        prvReleaseNetworkBufferDescriptor( pxStartDescriptor );
-        prvReleaseNetworkBufferDescriptor( pxCurDescriptor );
+        prvDiscardRxFrame( ppxStartDescriptor, ppxEndDescriptor, pxCurDescriptor );
         return;
     }
 

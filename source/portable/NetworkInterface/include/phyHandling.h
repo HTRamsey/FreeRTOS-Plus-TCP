@@ -156,6 +156,10 @@
     BaseType_t xPhyCheckLinkStatus( EthernetPhy_t * pxPhyObject,
                                     BaseType_t xHadReception );
 
+/* Return pdTRUE while at least one PHY link is up. */
+    #define xPhyIsLinkUp( pxPhyObject )    \
+    ( ( ( pxPhyObject )->ulLinkStatusMask != 0U ) ? pdTRUE : pdFALSE )
+
 /* Get the bitmask of a given 'EthernetPhy_t'. */
     #define xPhyGetMask( pxPhyObject ) \
     ( ( ( ( uint32_t ) 1u ) << ( pxPhyObject )->xPortCount ) - 1u )
