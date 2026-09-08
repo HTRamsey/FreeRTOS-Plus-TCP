@@ -158,6 +158,24 @@ static BaseType_t xPhySupportsGigabit( uint32_t ulPhyID )
 }
 /*-----------------------------------------------------------*/
 
+static BaseType_t prvWriteGigabitAdvertisement( EthernetPhy_t * pxPhyObject,
+                                               BaseType_t xPhyAddress,
+                                               uint32_t ulAdvertisement )
+{
+    uint32_t ulGigabitControl;
+
+    if( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_09_GBCR, &ulGigabitControl ) != 0 )
+    {
+        return -1;
+    }
+
+    ulGigabitControl &= ~phyGBCR_ADVERTISE_MASK;
+    ulGigabitControl |= ulAdvertisement;
+
+    return pxPhyObject->fnPhyWrite( xPhyAddress, phyREG_09_GBCR, ulGigabitControl );
+}
+/*-----------------------------------------------------------*/
+
 static BaseType_t xHas_1F_PHYSPCS( uint32_t ulPhyID )
 {
     BaseType_t xResult = pdFALSE;
@@ -527,12 +545,10 @@ BaseType_t xPhyConfigure( EthernetPhy_t * pxPhyObject,
 
         if( xPhySupportsGigabit( ulPhyID ) != pdFALSE )
         {
-            uint32_t ulGigabitControl;
-
-            pxPhyObject->fnPhyRead( xPhyAddress, phyREG_09_GBCR, &ulGigabitControl );
-            ulGigabitControl &= ~phyGBCR_ADVERTISE_MASK;
-            ulGigabitControl |= ulGigabitAdvertise;
-            pxPhyObject->fnPhyWrite( xPhyAddress, phyREG_09_GBCR, ulGigabitControl );
+            if( prvWriteGigabitAdvertisement( pxPhyObject, xPhyAddress, ulGigabitAdvertise ) != 0 )
+            {
+                return -1;
+            }
         }
 
         /*
@@ -652,6 +668,11 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
         return 0;
     }
 
+    /* A new negotiation invalidates the selected ports' cached link state.
+     * Keep them down on failure so callers retry rather than using stale mode
+     * information. Publish link-up only after reading the resolved mode. */
+    pxPhyObject->ulLinkStatusMask &= ~ulPhyMask;
+
     for( xPhyIndex = 0; xPhyIndex < ( uint32_t ) pxPhyObject->xPortCount; xPhyIndex++ )
     {
         if( ( ulPhyMask & ( 1lu << xPhyIndex ) ) != 0lu )
@@ -661,12 +682,10 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
 
             if( xPhySupportsGigabit( ulPhyID ) != pdFALSE )
             {
-                uint32_t ulGigabitControl;
-
-                pxPhyObject->fnPhyRead( xPhyAddress, phyREG_09_GBCR, &ulGigabitControl );
-                ulGigabitControl &= ~phyGBCR_ADVERTISE_MASK;
-                ulGigabitControl |= pxPhyObject->ulGCRValue;
-                pxPhyObject->fnPhyWrite( xPhyAddress, phyREG_09_GBCR, ulGigabitControl );
+                if( prvWriteGigabitAdvertisement( pxPhyObject, xPhyAddress, pxPhyObject->ulGCRValue ) != 0 )
+                {
+                    return -1;
+                }
             }
 
             /* Enable Auto-Negotiation. */
@@ -719,13 +738,13 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
     if( ulDoneMask != ( uint32_t ) 0U )
     {
         ulBitMask = ( uint32_t ) 1U;
-        pxPhyObject->ulLinkStatusMask &= ~( ulDoneMask );
 
         for( xPhyIndex = 0; xPhyIndex < ( uint32_t ) pxPhyObject->xPortCount; xPhyIndex++, ulBitMask <<= 1 )
         {
             BaseType_t xPhyAddress = pxPhyObject->ucPhyIndexes[ xPhyIndex ];
             uint32_t ulPhyID = pxPhyObject->ulPhyIDs[ xPhyIndex ];
             uint32_t ulSpeedMbps = 0U;
+            uint32_t ulLinkStatus;
 
             if( ( ulDoneMask & ulBitMask ) == ( uint32_t ) 0U )
             {
@@ -737,10 +756,7 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
 
             pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulRegValue );
 
-            if( ( ulRegValue & phyBMSR_LINK_STATUS ) != 0U )
-            {
-                pxPhyObject->ulLinkStatusMask |= ulBitMask;
-            }
+            ulLinkStatus = ulRegValue & phyBMSR_LINK_STATUS;
 
             if( ulPhyID == PHY_ID_KSZ8081MNXIA )
             {
@@ -839,7 +855,11 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
             {
                 uint32_t ulControlStatus = 0U;
 
-                pxPhyObject->fnPhyRead( xPhyAddress, phyREG_1A_PHYSR, &ulControlStatus );
+                if( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_1A_PHYSR, &ulControlStatus ) != 0 )
+                {
+                    return -1;
+                }
+
                 ulRegValue = 0U;
 
                 if( ( ulControlStatus & phyRTL8211_PHYSR_DUPLEX ) != 0U )
@@ -889,6 +909,11 @@ BaseType_t xPhyStartAutoNegotiation( EthernetPhy_t * pxPhyObject,
             if( ulSpeedMbps == 0U )
             {
                 ulSpeedMbps = ( ( ulRegValue & phyPHYSTS_SPEED_STATUS ) != 0U ) ? 10U : 100U;
+            }
+
+            if( ulLinkStatus != 0U )
+            {
+                pxPhyObject->ulLinkStatusMask |= ulBitMask;
             }
 
             FreeRTOS_printf( ( "Autonego ready: %08x: %s duplex %u mbit %s status\n",
@@ -960,10 +985,18 @@ BaseType_t xPhyCheckLinkStatus( EthernetPhy_t * pxPhyObject,
 
             if( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulStatus ) == 0 )
             {
-                /* The link-status bit is latch-low. Read BMSR again to get the
-                 * current state after clearing any latched link-loss event. */
-                if( ( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulStatus ) == 0 ) &&
-                    ( !!( pxPhyObject->ulLinkStatusMask & ulBitMask ) != !!( ulStatus & phyBMSR_LINK_STATUS ) ) )
+                /* Preserve a latched link loss while previously up: a brief
+                 * disconnect may have renegotiated a different speed/duplex.
+                 * Only clear stale latch-low status when already down. */
+                if( ( pxPhyObject->ulLinkStatusMask & ulBitMask ) == 0U )
+                {
+                    if( pxPhyObject->fnPhyRead( xPhyAddress, phyREG_01_BMSR, &ulStatus ) != 0 )
+                    {
+                        continue;
+                    }
+                }
+
+                if( !!( pxPhyObject->ulLinkStatusMask & ulBitMask ) != !!( ulStatus & phyBMSR_LINK_STATUS ) )
                 {
                     if( ( ulStatus & phyBMSR_LINK_STATUS ) != 0 )
                     {
