@@ -224,7 +224,7 @@ jobs:
 
       - name: Compile STM32 network interface and Ethernet HAL
         run: |
-          test/stm32-network-interface/compile.sh \
+          test/network-interface/stm32/compile.sh \
             "${{ matrix.family }}" \
             "$GITHUB_WORKSPACE/.stm32-ci/cmsis-core/CMSIS/Core/Include" \
             "$GITHUB_WORKSPACE/.stm32-ci/cmsis-device/Include" \

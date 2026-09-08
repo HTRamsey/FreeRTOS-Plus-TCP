@@ -12,7 +12,7 @@ cmsis_core_include="$2"
 cmsis_device_include="$3"
 hal_include="$4"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 
 case "${family}" in
     F1)

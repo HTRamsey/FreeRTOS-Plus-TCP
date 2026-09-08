@@ -180,4 +180,4 @@ CI cross-compiles this network interface and every bundled Ethernet HAL source
 for all eight supported families with warnings treated as errors. The pinned
 CMSIS Core, CMSIS Device, and supporting HAL revisions are recorded in
 `.github/workflows/ci.yml`; the reusable compile command is
-`test/stm32-network-interface/compile.sh`.
+`test/network-interface/stm32/compile.sh`.
