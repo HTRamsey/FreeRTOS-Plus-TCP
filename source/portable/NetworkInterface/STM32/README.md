@@ -33,6 +33,11 @@ checksum offload, and batched receive-event delivery:
 The driver uses file-static HAL, PHY, task, semaphore, and address-filter
 state. Consequently, one Ethernet peripheral instance is supported.
 
+On STM32N6, initialization checks the configured DMA channel and MTL queue
+counts against the hardware capabilities reported by the HAL. Initialization
+fails before starting DMA if a configured count exceeds the available
+capacity. Descriptor arrays retain their compile-time sizes.
+
 ### Media and PHY
 
 The unified driver keeps the legacy STM32 network-interface configuration

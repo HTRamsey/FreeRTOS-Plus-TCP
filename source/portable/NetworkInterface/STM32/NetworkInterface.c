@@ -645,6 +645,8 @@ static uint8_t ucAddrHashCounters[ niEMAC_ADDRESS_HASH_BITS ] = { 0U };
                                               size_t uxLength,
                                               size_t * puxAlignedLength )
     {
+        /* Retain explicit alignment for application-supplied CMSIS versions
+         * whose cache maintenance functions require an aligned address. */
         const uintptr_t uxAddress = ( uintptr_t ) pvAddress;
         const uintptr_t uxLineStart = uxAddress & ~( ( uintptr_t ) niEMAC_DATA_ALIGNMENT_MASK );
         const uintptr_t uxLineEnd = ( uxAddress + uxLength + niEMAC_DATA_ALIGNMENT_MASK ) & ~( ( uintptr_t ) niEMAC_DATA_ALIGNMENT_MASK );
@@ -1861,6 +1863,27 @@ static BaseType_t prvEthConfigInit( ETH_HandleTypeDef * pxEthHandle,
 
         if( HAL_ETH_Init( pxEthHandle ) == HAL_OK )
         {
+            #if defined( niEMAC_STM32NX )
+                /* Clocks are now enabled by HAL_ETH_MspInit(). Check the
+                 * hardware capacities before starting any DMA channel; the
+                 * descriptor arrays remain sized by the HAL configuration. */
+                const uint32_t ulRxChannels = HAL_ETHEx_GetRxDMAChNumber( pxEthHandle );
+                const uint32_t ulTxChannels = HAL_ETHEx_GetTxDMAChNumber( pxEthHandle );
+                const uint32_t ulRxQueues = HAL_ETHEx_GetRxMTLQNumber( pxEthHandle );
+                const uint32_t ulTxQueues = HAL_ETHEx_GetTxMTLQNumber( pxEthHandle );
+
+                if( ( ETH_DMA_RX_CH_CNT > ulRxChannels ) ||
+                    ( ETH_DMA_TX_CH_CNT > ulTxChannels ) ||
+                    ( ETH_DMA_CH_CNT > ulRxChannels ) ||
+                    ( ETH_DMA_CH_CNT > ulTxChannels ) ||
+                    ( ETH_MTL_RX_Q_CNT > ulRxQueues ) ||
+                    ( ETH_MTL_TX_Q_CNT > ulTxQueues ) )
+                {
+                    FreeRTOS_debug_printf( ( "prvEthConfigInit: Configured DMA channels or MTL queues exceed hardware capacity\n" ) );
+                    return pdFALSE;
+                }
+            #endif
+
             #if defined( niEMAC_STM32FX )
                 /* This function doesn't get called in Fxx driver */
                 HAL_ETH_SetMDIOClockRange( pxEthHandle );
